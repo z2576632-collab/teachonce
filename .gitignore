@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Testing / linting caches
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+
+# TeachOnce local data — personal learning records stay local by default
+.teachonce/
+*.sqlite3
+*.sqlite
+*.db
+
+# Local demo outputs
+demo_out/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Secrets — never commit
+.env
+.env.*
+*.key
+secrets.json
