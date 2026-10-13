@@ -1,0 +1,53 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "teachonce"
+version = "0.1.0"
+description = "Teach your AI once. Let it learn how you work. — A personal work-experience learning engine exposed via Agent Skills + MCP."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "z2576632-collab" }]
+keywords = ["ai", "agent", "mcp", "agent-skills", "learning", "knowledge-transfer"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "mcp>=2.0.0",
+    "httpx>=0.27.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+[project.scripts]
+teachonce-mcp = "teachonce.mcp_server:main"
+# Demo runs from the repository root: `python -m demo.run_demo`
+# (the demo package is intentionally not part of the distribution)
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/teachonce"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests", "demo"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+ignore = ["E501"]  # long lines allowed in prompt strings
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "."]
+addopts = "-q"
