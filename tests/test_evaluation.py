@@ -171,3 +171,57 @@ def test_heuristic_without_keywords_uses_expected_decision(store):
     # "考试资料" appears in both versions' rule text
     assert report.score_a == 1.0
     assert report.score_b == 1.0
+
+
+@pytest.mark.parametrize("verdict", ["false", "true", 0, 1, None, [], {}])
+def test_judge_requires_actual_boolean_and_does_not_save_invalid_report(store, verdict):
+    skill_id = _setup_two_versions(store)
+    response = json.dumps(
+        {"predicted_decision": "参考/", "matches_expected": verdict, "reasoning": "no rule"}
+    )
+    evaluator = SkillEvaluator(store, ScriptedLLM([response]))
+    with pytest.raises(SchemaValidationError, match="JSON boolean"):
+        evaluator.evaluate(skill_id, 1, 2, CASES, method="llm_judge")
+    assert store.list_eval_reports(skill_id) == []
+
+
+@pytest.mark.parametrize("field", ["predicted_decision", "reasoning"])
+@pytest.mark.parametrize("value", [None, "  ", 42])
+def test_judge_requires_prediction_and_reasoning(store, field, value):
+    skill_id = _setup_two_versions(store)
+    response = {"predicted_decision": "参考/", "matches_expected": False, "reasoning": "no rule"}
+    response[field] = value
+    evaluator = SkillEvaluator(store, ScriptedLLM([json.dumps(response)]))
+    with pytest.raises(SchemaValidationError, match=field):
+        evaluator.evaluate(skill_id, 1, 2, CASES, method="llm_judge")
+    assert store.list_eval_reports(skill_id) == []
+
+
+@pytest.mark.parametrize(
+    "bad_case",
+    [
+        None,
+        {"situation": None, "expected_decision": "x"},
+        {"situation": "x", "expected_decision": 5},
+        {"situation": "x", "expected_decision": "y", "keywords": "word"},
+        {"situation": "x", "expected_decision": "y", "keywords": [""]},
+    ],
+)
+def test_all_cases_validated_before_any_llm_call(store, bad_case):
+    skill_id = _setup_two_versions(store)
+    llm = ScriptedLLM([])
+    with pytest.raises(SchemaValidationError):
+        SkillEvaluator(store, llm).evaluate(skill_id, 1, 2, [CASES[0], bad_case])
+    assert not llm.calls
+    assert store.list_eval_reports(skill_id) == []
+
+
+def test_user_notes_cannot_replace_method_limitations(store):
+    skill_id = _setup_two_versions(store)
+    report = SkillEvaluator(store).evaluate(
+        skill_id, 1, 2, CASES, method="heuristic", notes="Release review"
+    )
+    saved = store.list_eval_reports(skill_id)[0]
+    assert "NOT semantic understanding" in report.notes
+    assert "Release review" in saved.notes
+    assert saved.notes == report.notes

@@ -21,10 +21,11 @@ import json
 import os
 import sqlite3
 import threading
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from .errors import NotFoundError
+from .errors import NotFoundError, VersionStateError
 from .models import (
     Correction,
     Demonstration,
@@ -268,6 +269,11 @@ class SkillStore:
 
     @_locked
     def add_skill_version(self, sv: SkillVersion) -> None:
+        self._insert_skill_version(sv)
+        self._conn.commit()
+
+    def _insert_skill_version(self, sv: SkillVersion) -> None:
+        """Insert without committing; callers hold the connection lock."""
         if self._conn.execute(
             "SELECT 1 FROM skill_versions WHERE skill_id = ? AND version = ?",
             (sv.skill_id, sv.version),
@@ -298,7 +304,37 @@ class SkillStore:
                 sv.created_at,
             ),
         )
-        self._conn.commit()
+
+    @_locked
+    def save_revision(self, sv: SkillVersion, correction_ids: list[str]) -> SkillVersion:
+        """Allocate a version and consume its corrections in one transaction.
+
+        The input's version number is replaced. A stale correction or a failed
+        write leaves both the version history and correction records untouched.
+        BEGIN IMMEDIATE also serializes writers using separate connections.
+        """
+        if not correction_ids or len(correction_ids) != len(set(correction_ids)):
+            raise VersionStateError("Provide distinct open correction ids to save a revision.")
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            saved = replace(sv, version=self.next_version_number(sv.skill_id))
+            self._insert_skill_version(saved)
+            for correction_id in correction_ids:
+                cur = self._conn.execute(
+                    "UPDATE corrections SET status = 'applied', applied_in_version = ? "
+                    "WHERE id = ? AND skill_id = ? AND status = 'open'",
+                    (saved.version, correction_id, sv.skill_id),
+                )
+                if cur.rowcount != 1:
+                    raise VersionStateError(
+                        f"Correction '{correction_id}' is no longer open for this skill. "
+                        "Reload its corrections before retrying."
+                    )
+            self._conn.commit()
+        except BaseException:
+            self._conn.rollback()
+            raise
+        return saved
 
     @_locked
     def get_skill_version(self, skill_id: str, version: int) -> SkillVersion:

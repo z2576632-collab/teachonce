@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "teachonce"
-version = "0.1.0"
+version = "0.2.0"
 description = "Teach your AI once. Let it learn how you work. — A personal work-experience learning engine exposed via Agent Skills + MCP."
 readme = "README.md"
 requires-python = ">=3.12"

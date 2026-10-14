@@ -14,8 +14,8 @@ TeachOnce 是一个**纯 Python 库 + MCP Server**，无独立 UI、无后台常
                 │ MCP (stdio)                 │ 导入 Agent Skills
                 ▼                             ▼
 ┌───────────────────────────────┐   ┌─────────────────────┐
-│   mcp_server.py (FastMCP)     │   │  skill_export.py    │
-│  11 个工具：导入/生成/匹配/     │   │  SKILL.md 标准导出   │
+│   mcp_server.py (MCPServer)   │   │  skill_export.py    │
+│  14 个工具：导入/生成/匹配/     │   │  SKILL.md 标准导出   │
 │  纠错/审批/回滚/评估/导出       │   └─────────────────────┘
 └───────┬───────────────────────┘              ▲
         │ 编排（无业务逻辑）                     │
@@ -80,6 +80,8 @@ TeachOnce 是一个**纯 Python 库 + MCP Server**，无独立 UI、无后台常
 - `skill_versions` 主键 `(skill_id, version)`，**只增不改**；`skills.active_version` 单独维护指针。
 - 复杂结构（步骤、规则列表）以 JSON 文本列存储——SQLite + JSON 是"单文件、零运维、可检查"的平衡点；避免过早引入向量库/服务化。
 - 时间戳统一 UTC ISO-8601。
+- `save_revision` 使用 `BEGIN IMMEDIATE` 在同一事务中分配版本号、追加版本、更新纠错状态；
+  对纠错所属 Skill 和 `open` 状态做条件更新，冲突时整笔回滚。模型调用在事务外完成。
 
 ## 5. LLM Provider 层（`llm.py`）
 
@@ -114,6 +116,8 @@ LLMProvider (ABC)
 ### 6.3 correction.py（纠错 → 新版本）
 - `record_correction`：LLM 归类（wrong_decision / missing_rule / too_broad / too_narrow / other）+ 摘要。
 - `apply_correction`：输入原版本 + 全部相关纠错 → LLM 输出修订版规则（每条变更带 `op`(add/modify/remove) 与理由）→ 落库为 `candidate` 新版本，changelog 结构化。
+- 显式纠错 ID 必须唯一、属于当前 Skill 且仍为 `open`；调用模型前检查，入库时再次验证状态以处理并发。
+- 修订继承基准版本的累计纠错来源；校验器保留模型提供的规则 ID，并拒绝重复 / 非法 ID，使变更说明可对应到规则。
 - `approve_version` / `rollback_to`：人工审批后 active 指针移动；回滚仅移动指针，历史可追溯。
 
 ### 6.4 evaluation.py（未见案例回归）
@@ -122,24 +126,31 @@ LLMProvider (ABC)
   1. `llm_judge`（默认，需 API）：LLM 判断"该版本规则是否支持得出 expected_decision"；
   2. `heuristic`（离线）：规则文本与期望决策的关键词/短语重叠 —— **启发式，非语义理解**，报告中明确标注局限。
 - 输出 `EvalReport`（score_a / score_b / per-case 明细）落库；比较结论遵循"v2 不劣于 v1 且修复被纠错问题"的验收口径。
+- 所有案例先校验再请求 LLM；裁判结果要求 JSON 布尔值和非空判断 / 理由，非法输出拒绝保存报告。
+- 方法局限始终写入报告，自定义备注仅追加；当前裁判能看到期望答案，因此衡量的是规则支持性，
+  不等同于独立执行成功率。调用者负责保证案例未用于学习，系统尚不自动检测样本重叠。
 
-## 7. MCP 接口（`mcp_server.py`，FastMCP）
+## 7. MCP 接口（`mcp_server.py`，MCPServer）
 
-工具面（11 个，全部纯编排调用引擎层）：
+工具面（14 个，全部纯编排调用引擎层或存储层）：
 
 | 工具 | 引擎调用 |
 |---|---|
 | `teachonce_import_demonstration` | learning.import_demonstration |
+| `teachonce_list_demonstrations` | store.list_demonstrations（重启后恢复示范 ID） |
 | `teachonce_generate_skill` | learning.extract_candidate_skill |
 | `teachonce_list_skills` / `teachonce_get_skill` | store |
 | `teachonce_match_skill` | matching.match |
 | `teachonce_record_correction` | correction.record_correction |
+| `teachonce_list_corrections` | store.list_corrections（支持 open / applied 过滤） |
 | `teachonce_apply_correction` | correction.apply_correction |
 | `teachonce_approve_version` / `teachonce_rollback` | correction 审批/回滚 |
 | `teachonce_evaluate_versions` | evaluation.evaluate |
+| `teachonce_list_evaluations` | store.list_eval_reports（包含方法局限和逐例结论） |
 | `teachonce_export_skill_md` | skill_export |
 
 传输：stdio（默认）。返回值一律为 JSON-able dict；错误以异常抛出（MCP 会转为工具错误），不吞错。
+历史查询为本地只读操作，不初始化 LLM。重启后只要连接同一数据库即可恢复；查询结果返回给宿主 Agent。
 
 ## 8. Agent Skills 导出（`skill_export.py`）
 

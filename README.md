@@ -66,19 +66,63 @@ Demo 剧本：人类示范 3 次整理课程资料 → AI 提取 Skill → 遇�
 teachonce-mcp   # 或 python -m teachonce.mcp_server
 ```
 
-在支持 MCP 的 Agent（WorkBuddy / Claude Code / Cursor / 其他）中配置 stdio server 即可。暴露的工具：
+在支持 MCP 的 Agent（WorkBuddy / Claude Code / Cursor / 其他）中配置 stdio server 即可。
+配置示例（写入 Agent 的 MCP 配置文件，如 WorkBuddy 的 `~/.workbuddy/mcp.json`、
+Claude Code 的 `~/.claude.json`，用你实际环境的 Python 绝对路径替换 `command`）：
+
+```json
+{
+  "mcpServers": {
+    "teachonce": {
+      "command": "/absolute/path/to/python",
+      "args": ["-m", "teachonce.mcp_server"],
+      "env": {
+        "TEACHCONE_LLM_API_KEY": "sk-...",
+        "TEACHCONE_LLM_BASE_URL": "https://api.deepseek.com/v1",
+        "TEACHCONE_LLM_MODEL": "deepseek-chat"
+      }
+    }
+  }
+}
+```
+
+前提是该 Python 环境已 `pip install -e` 本仓库。不配 `env` 也能启动：
+历史查询类工具不需要 LLM，学习类工具会在调用时明确提示缺 Key。
+
+暴露的工具：
 
 | MCP 工具 | 作用 |
 |---|---|
 | `teachonce_import_demonstration` | 导入一次任务示范 |
+| `teachonce_list_demonstrations` | 找回已保存的示范和 ID，继续生成 Skill |
 | `teachonce_generate_skill` | 从示范生成候选 Skill |
 | `teachonce_match_skill` | 为新任务匹配 Skill 并说明理由 |
 | `teachonce_get_skill` / `teachonce_list_skills` | 查看 Skill 与其全部版本 |
 | `teachonce_record_correction` | 记录自然语言纠错 |
+| `teachonce_list_corrections` | 查看待处理纠错或全部纠错历史 |
 | `teachonce_apply_correction` | 生成改进版 Skill（保留历史） |
 | `teachonce_approve_version` / `teachonce_rollback` | 审批新版本 / 回滚到历史版本 |
 | `teachonce_evaluate_versions` | 用未见案例对比两个版本 |
+| `teachonce_list_evaluations` | 读取历史评估的逐例结论与方法局限 |
 | `teachonce_export_skill_md` | 导出 Agent Skills 标准 SKILL.md |
+
+### 5. 换一个聊天后继续学习
+
+只要 MCP Server 仍使用同一个数据库（默认 `~/.teachonce/teachonce.db`），
+新聊天或服务重启后都可以从保存的记录继续：
+
+1. 调用 `teachonce_list_demonstrations` 找回示范 ID，再用 `teachonce_generate_skill` 提取经验。
+2. 调用 `teachonce_list_skills` 找到 Skill，用 `teachonce_list_corrections(skill_id, status="open")` 查看待处理反馈。
+3. 调用 `teachonce_apply_correction` 生成候选版；已有规则 ID 与前几轮纠错来源会保留。
+4. 用未见案例评估候选版；之后可随时用 `teachonce_list_evaluations(skill_id)` 重新读取报告。
+5. 人工审查规则、变更说明和逐例评估结果后，调用 `teachonce_approve_version`。
+
+这三个查询工具不需要 API Key，也不会重新请求模型。读取记录会将内容返回给调用它的宿主 Agent。
+纠错只能用于所属 Skill，已应用的纠错不能重复消费；若需继续调整，请记录新反馈。
+并发请求或写入失败不会留下“新版本已生成、纠错却没标记”的半完成状态。
+
+评估仅接受真正的 JSON 布尔值 `true` / `false`；字符串 `"false"` 等无效输出会报错，
+不会生成评估分数。报告始终保留方法局限，自定义备注不能覆盖它们。
 
 ## 项目结构
 
@@ -110,7 +154,8 @@ teachonce/
 - ✅ 任务匹配（置信度 + 匹配理由 + 低置信度转人工确认）
 - ✅ 自然语言纠错 → 版本化更新（changelog / 审批 / 回滚）
 - ✅ 未见案例版本评估（LLM 裁判 + 离线启发式两种模式，均如实标注方法论）
-- ✅ MCP Server（11 个工具）+ Agent Skills `SKILL.md` 导出
+- ✅ MCP Server（14 个工具，含示范 / 纠错 / 评估历史查询）+ Agent Skills `SKILL.md` 导出
+- ✅ 多轮纠错保留规则标识和累计证据，版本与纠错状态原子保存
 - ✅ SQLite 本地存储，数据默认不出本机
 - ✅ pytest 全套测试 + ruff + GitHub Actions CI
 

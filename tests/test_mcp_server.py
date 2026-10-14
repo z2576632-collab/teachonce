@@ -10,12 +10,21 @@ import asyncio
 import json
 from typing import Any
 
-from teachonce.llm import ScriptedLLM
+import pytest
+from mcp.server.mcpserver.exceptions import ToolError
+
+from teachonce.errors import NotFoundError
+from teachonce.llm import OpenAICompatibleLLM, ScriptedLLM
 from teachonce.mcp_server import build_server
+from teachonce.models import Correction, Demonstration, EvalReport, Skill
+from teachonce.store import SkillStore
 
 ALL_TOOLS = {
     "teachonce_import_demonstration",
     "teachonce_generate_skill",
+    "teachonce_list_demonstrations",
+    "teachonce_list_corrections",
+    "teachonce_list_evaluations",
     "teachonce_list_skills",
     "teachonce_get_skill",
     "teachonce_match_skill",
@@ -265,3 +274,85 @@ def test_evaluate_via_mcp_heuristic(store):
     )
     assert out["method"] == "heuristic"
     assert out["score_a"] == 1.0
+
+
+def test_saved_history_is_available_after_restart_without_llm(tmp_path, monkeypatch):
+    db_path = tmp_path / "history.db"
+    original = SkillStore(db_path)
+    skill = Skill.create("Saved skill")
+    demo = Demonstration.create("Organize notes", steps=[{"action": "Sort by course"}])
+    open_feedback = Correction.create(skill.id, 1, "Keep recordings together")
+    applied_feedback = Correction.create(skill.id, 1, "Preserve older files")
+    report = EvalReport.create(
+        skill.id,
+        1,
+        2,
+        "heuristic",
+        0.0,
+        1.0,
+        results=[{"supported_a": False, "supported_b": True}],
+        notes="Keyword overlap only, not semantic understanding.",
+    )
+    try:
+        original.add_demonstration(demo)
+        original.create_skill(skill)
+        original.add_correction(open_feedback)
+        original.add_correction(applied_feedback)
+        original.mark_correction_applied(applied_feedback.id, 2)
+        original.save_eval_report(report)
+    finally:
+        original.close()
+
+    def unexpected_llm(*args, **kwargs):
+        pytest.fail("History tools must not resolve or call an LLM")
+
+    monkeypatch.setattr(OpenAICompatibleLLM, "from_env", unexpected_llm)
+    reopened = SkillStore(db_path)
+    try:
+        mcp = build_server(store=reopened)
+        demos = _call(mcp, "teachonce_list_demonstrations")
+        assert demos == {"demonstrations": [demo.to_dict()], "count": 1}
+        pending = _call(mcp, "teachonce_list_corrections", {"skill_id": skill.id, "status": "open"})
+        assert pending == {"corrections": [open_feedback.to_dict()], "count": 1}
+        applied = _call(
+            mcp, "teachonce_list_corrections", {"skill_id": skill.id, "status": "applied"}
+        )
+        assert applied["count"] == 1
+        assert applied["corrections"][0]["applied_in_version"] == 2
+        all_feedback = _call(mcp, "teachonce_list_corrections", {"skill_id": skill.id})
+        assert all_feedback["count"] == 2
+        reports = _call(mcp, "teachonce_list_evaluations", {"skill_id": skill.id})
+        assert reports == {"reports": [report.to_dict()], "count": 1}
+    finally:
+        reopened.close()
+
+
+@pytest.mark.parametrize("tool", ["teachonce_list_corrections", "teachonce_list_evaluations"])
+def test_history_tools_report_unknown_skill(store, tool):
+    mcp = build_server(store=store)
+    with pytest.raises(ToolError) as exc:
+        _call(mcp, tool, {"skill_id": "skill_missing"})
+    assert isinstance(exc.value.__cause__, NotFoundError)
+
+
+def test_list_corrections_rejects_unknown_status(store):
+    skill = Skill.create("Skill")
+    store.create_skill(skill)
+    mcp = build_server(store=store)
+    with pytest.raises(ToolError):
+        _call(mcp, "teachonce_list_corrections", {"skill_id": skill.id, "status": "typo"})
+
+
+def test_history_tools_return_empty_collections(store):
+    skill = Skill.create("Skill")
+    store.create_skill(skill)
+    mcp = build_server(store=store)
+    assert _call(mcp, "teachonce_list_demonstrations") == {"demonstrations": [], "count": 0}
+    assert _call(mcp, "teachonce_list_corrections", {"skill_id": skill.id}) == {
+        "corrections": [],
+        "count": 0,
+    }
+    assert _call(mcp, "teachonce_list_evaluations", {"skill_id": skill.id}) == {
+        "reports": [],
+        "count": 0,
+    }

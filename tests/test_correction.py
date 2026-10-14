@@ -15,7 +15,7 @@ from teachonce.errors import (
     VersionStateError,
 )
 from teachonce.llm import ScriptedLLM
-from teachonce.models import DecisionRule, Skill, SkillVersion
+from teachonce.models import Correction, DecisionRule, Skill, SkillVersion
 
 
 def _setup_v1(store) -> tuple[str, SkillVersion]:
@@ -221,3 +221,89 @@ def test_approve_requires_existing_version(store):
     engine = CorrectionEngine(store)
     with pytest.raises(NotFoundError):
         engine.approve_version(skill_id, 99)
+
+
+def test_second_revision_preserves_prior_evidence_and_rule_ids(store):
+    skill_id, _ = _setup_v1(store)
+    engine = CorrectionEngine(store, ScriptedLLM([_record_payload()]))
+    c1 = engine.record_correction(skill_id, "录音单独存放")
+    engine.llm = ScriptedLLM([_revision_payload(c1.id)])
+    v2 = engine.apply_correction(skill_id)
+    engine.approve_version(skill_id, v2.version)
+    before = [v.to_dict() for v in store.list_skill_versions(skill_id)]
+
+    engine.llm = ScriptedLLM([_record_payload()])
+    c2 = engine.record_correction(skill_id, "课程目录使用完整课程名")
+    payload = json.loads(_revision_payload(c1.id))
+    payload["decision_rules"][0]["decision"] = "按完整课程名分文件夹"
+    payload["decision_rules"][0]["sources"].append(c2.id)
+    payload["changes"] = [{"op": "modify", "rule_id": "rule_base", "description": "使用完整课程名"}]
+    engine.llm = ScriptedLLM([json.dumps(payload)])
+    v3 = engine.apply_correction(skill_id)
+
+    assert v3.version == 3 and v3.status == "candidate"
+    assert v3.derived_from["corrections"] == [c1.id, c2.id]
+    assert v3.decision_rules[1].sources == [c1.id]
+    assert [r.id for r in v3.decision_rules] == [r.id for r in v2.decision_rules]
+    assert v3.changes[0]["rule_id"] == v3.decision_rules[0].id
+    assert not any(c1.id in question for question in v3.open_questions)
+    assert [v.to_dict() for v in store.list_skill_versions(skill_id)[:2]] == before
+    assert store.get_skill(skill_id).active_version == 2
+
+
+def test_correction_from_another_skill_is_rejected_before_llm(store):
+    skill_id, _ = _setup_v1(store)
+    other_id, _ = _setup_v1(store)
+    correction = Correction.create(other_id, 1, "Feedback for another skill")
+    store.add_correction(correction)
+    llm = ScriptedLLM([])
+    with pytest.raises(SchemaValidationError, match="another skill"):
+        CorrectionEngine(store, llm).apply_correction(skill_id, correction_ids=[correction.id])
+    assert not llm.calls
+    assert store.get_correction(correction.id).status == "open"
+    assert len(store.list_skill_versions(skill_id)) == 1
+
+
+def test_applied_correction_cannot_be_reused(store):
+    skill_id, _ = _setup_v1(store)
+    correction = Correction.create(skill_id, 1, "New recording rule")
+    store.add_correction(correction)
+    engine = CorrectionEngine(store, ScriptedLLM([_revision_payload(correction.id)]))
+    v2 = engine.apply_correction(skill_id)
+    llm = ScriptedLLM([])
+    with pytest.raises(VersionStateError, match="already applied"):
+        CorrectionEngine(store, llm).apply_correction(skill_id, correction_ids=[correction.id])
+    assert not llm.calls
+    assert store.get_correction(correction.id).applied_in_version == v2.version
+    assert len(store.list_skill_versions(skill_id)) == 2
+
+
+def test_duplicate_correction_ids_rejected_before_llm(store):
+    skill_id, _ = _setup_v1(store)
+    correction = Correction.create(skill_id, 1, "New rule")
+    store.add_correction(correction)
+    llm = ScriptedLLM([])
+    with pytest.raises(SchemaValidationError, match="unique"):
+        CorrectionEngine(store, llm).apply_correction(
+            skill_id, correction_ids=[correction.id, correction.id]
+        )
+    assert not llm.calls
+    assert store.get_correction(correction.id).status == "open"
+
+
+def test_correction_consumed_during_llm_call_does_not_create_extra_version(store):
+    skill_id, _ = _setup_v1(store)
+    correction = Correction.create(skill_id, 1, "New rule")
+    store.add_correction(correction)
+
+    def competing_revision(system, user):
+        other = CorrectionEngine(store, ScriptedLLM([_revision_payload(correction.id)]))
+        other.apply_correction(skill_id)
+        return _revision_payload(correction.id)
+
+    engine = CorrectionEngine(store, ScriptedLLM([competing_revision]))
+    with pytest.raises(VersionStateError, match="no longer open"):
+        engine.apply_correction(skill_id)
+    assert [v.version for v in store.list_skill_versions(skill_id)] == [1, 2]
+    assert store.get_correction(correction.id).applied_in_version == 2
+    assert store.get_skill(skill_id).active_version == 1
