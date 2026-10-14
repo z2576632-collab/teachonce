@@ -45,3 +45,21 @@ class VersionStateError(TeachOnceError):
     History is append-only: refuse to approve a non-existent version,
     roll back to a candidate, or mutate an existing version in place.
     """
+
+
+class AdapterUnavailableError(TeachOnceError):
+    """An optional third-party adapter dependency is not installed.
+
+    Adapters are optional extras (AGENTS.md §8): install the matching extra
+    (e.g. ``pip install "teachonce[gepa]"``) and retry. The error message
+    must name the exact extra to install.
+    """
+
+
+class ConsentRequiredError(TeachOnceError):
+    """A capability that requires explicit user consent was invoked without it.
+
+    GUI observation is off by default (AGENTS.md §5.3). The user enables it
+    deliberately via the documented environment switch; TeachOnce never
+    records the screen without that opt-in.
+    """

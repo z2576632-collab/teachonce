@@ -32,9 +32,10 @@ TeachOnce = **Agent Skill + MCP Server**，学习个人工作经验的引擎。
 | `evaluation.py` | 未见案例的版本对比 | 必须如实标注评估方法及其局限 |
 | `skill_export.py` | Agent Skills 标准导出 | 不发明非标准格式 |
 | `mcp_server.py` | MCP 工具面 | 工具函数只做编排，不含业务逻辑 |
+| `adapters/` | 第三方项目隔离接入（GEPA 优化、OpenAdapt 录制导入） | 可选 extra、懒加载、报错给安装命令；GUI 能力调用时检查显式授权 |
 
-依赖方向：`mcp_server → {learning, matching, correction, evaluation, skill_export} → {store, llm} → models`。
-**不允许反向依赖或循环依赖。**
+依赖方向：`mcp_server → {learning, matching, correction, evaluation, skill_export, adapters(懒加载)} → {store, llm} → models`。
+**不允许反向依赖或循环依赖**；核心引擎不感知任何适配器。
 
 ## 3. 代码规范
 
