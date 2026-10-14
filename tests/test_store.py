@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from teachonce.errors import NotFoundError
+from teachonce.errors import NotFoundError, VersionStateError
 from teachonce.models import (
     Correction,
     Demonstration,
@@ -13,6 +13,7 @@ from teachonce.models import (
     Skill,
     SkillVersion,
 )
+from teachonce.store import SkillStore
 
 
 def _version(skill_id: str, version: int, *, status: str = "candidate") -> SkillVersion:
@@ -123,3 +124,61 @@ def test_update_skill_meta(store):
     store.create_skill(skill)
     store.update_skill_meta(skill.id, description="new desc")
     assert store.get_skill(skill.id).description == "new desc"
+
+
+def test_revision_rolls_back_all_writes_if_any_correction_is_stale(store):
+    skill = Skill.create("Atomic revisions")
+    store.create_skill(skill)
+    store.add_skill_version(_version(skill.id, 1, status="approved"))
+    c1 = Correction.create(skill.id, 1, "First feedback")
+    c2 = Correction.create(skill.id, 1, "Second feedback")
+    store.add_correction(c1)
+    store.add_correction(c2)
+    initial = store.save_revision(_version(skill.id, 0), [c2.id])
+    assert initial.version == 2
+
+    with pytest.raises(VersionStateError, match="no longer open"):
+        store.save_revision(_version(skill.id, 0), [c1.id, c2.id])
+    assert [v.version for v in store.list_skill_versions(skill.id)] == [1, 2]
+    assert store.get_correction(c1.id).status == "open"
+    assert store.get_correction(c1.id).applied_in_version is None
+    assert store.get_correction(c2.id).applied_in_version == 2
+    # The rollback releases the transaction and the unused version number.
+    assert store.save_revision(_version(skill.id, 0), [c1.id]).version == 3
+
+
+@pytest.mark.parametrize("ids", [[], ["same", "same"], ["missing"]])
+def test_revision_rejects_invalid_corrections_without_writing(store, ids):
+    skill = Skill.create("Skill")
+    store.create_skill(skill)
+    with pytest.raises(VersionStateError):
+        store.save_revision(_version(skill.id, 0), ids)
+    assert store.list_skill_versions(skill.id) == []
+
+
+def test_concurrent_connections_allocate_distinct_revision_numbers(store):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    skill = Skill.create("Concurrent revisions")
+    store.create_skill(skill)
+    store.add_skill_version(_version(skill.id, 1, status="approved"))
+    corrections = [Correction.create(skill.id, 1, text) for text in ("One", "Two")]
+    for correction in corrections:
+        store.add_correction(correction)
+    ready = Barrier(2)
+
+    def save(correction):
+        connection = SkillStore(store.db_path)
+        try:
+            ready.wait(timeout=5)
+            return connection.save_revision(_version(skill.id, 0), [correction.id]).version
+        finally:
+            connection.close()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        versions = list(pool.map(save, corrections))
+    assert sorted(versions) == [2, 3]
+    assert [v.version for v in store.list_skill_versions(skill.id)] == [1, 2, 3]
+    for correction, version in zip(corrections, versions, strict=True):
+        assert store.get_correction(correction.id).applied_in_version == version

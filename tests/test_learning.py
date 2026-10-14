@@ -11,7 +11,7 @@ from teachonce.errors import (
     SchemaValidationError,
     SensitiveContentError,
 )
-from teachonce.learning import LearningEngine
+from teachonce.learning import LearningEngine, validate_skill_payload
 from teachonce.llm import ScriptedLLM
 
 
@@ -137,6 +137,30 @@ def test_extract_filters_hallucinated_sources(store):
     rule = sv.decision_rules[0]
     assert rule.sources == [d1]  # hallucinated id dropped
     assert any("demo_does_not_exist" in q for q in sv.open_questions)
+
+
+def test_rule_ids_survive_validation():
+    payload = json.loads(_extraction_payload(["demo_1"]))
+    payload["decision_rules"][0]["id"] = "rule_kept"
+    cleaned = validate_skill_payload(payload, valid_ids={"demo_1"})
+    assert cleaned["decision_rules"][0].id == "rule_kept"
+
+
+@pytest.mark.parametrize("rule_id", ["", "  ", 42, [], {}])
+def test_invalid_rule_ids_rejected(rule_id):
+    payload = json.loads(_extraction_payload([]))
+    payload["decision_rules"][0]["id"] = rule_id
+    with pytest.raises(SchemaValidationError, match="rule 'id'"):
+        validate_skill_payload(payload, valid_ids=set())
+
+
+def test_duplicate_rule_ids_rejected():
+    payload = json.loads(_extraction_payload([]))
+    rule = payload["decision_rules"][0]
+    rule["id"] = "rule_one"
+    payload["decision_rules"].append(dict(rule, decision="A different decision"))
+    with pytest.raises(SchemaValidationError, match="Duplicate decision rule id"):
+        validate_skill_payload(payload, valid_ids=set())
 
 
 def test_extract_rejects_unparseable_response(store):

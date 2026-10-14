@@ -168,6 +168,8 @@ class CorrectionEngine:
         skill = self.store.get_skill(skill_id)
 
         if correction_ids is not None:
+            if len(correction_ids) != len(set(correction_ids)):
+                raise SchemaValidationError("Correction ids must be unique; remove duplicates.")
             corrections = [self.store.get_correction(cid) for cid in correction_ids]
             if not corrections:
                 raise TeachOnceError("No correction ids provided.")
@@ -177,6 +179,19 @@ class CorrectionEngine:
                 raise TeachOnceError(
                     f"Skill '{skill.name}' has no open corrections. Record a "
                     "correction first (record_correction), then apply."
+                )
+
+        for correction in corrections:
+            if correction.skill_id != skill_id:
+                raise SchemaValidationError(
+                    f"Correction '{correction.id}' belongs to another skill. "
+                    "Choose corrections for the skill being revised."
+                )
+            if correction.status != "open":
+                raise VersionStateError(
+                    f"Correction '{correction.id}' was already applied in "
+                    f"v{correction.applied_in_version}. Select open corrections or "
+                    "record new feedback."
                 )
 
         if base_version is None:
@@ -194,9 +209,12 @@ class CorrectionEngine:
         raw = llm.complete(_APPLY_SYSTEM_PROMPT, user_prompt, json_mode=True)
         data = parse_json_response(raw)
 
-        valid_ids = set(base_sv.derived_from.get("demonstrations", [])) | {
-            c.id for c in corrections
-        }
+        correction_sources = list(
+            dict.fromkeys(
+                [*base_sv.derived_from.get("corrections", []), *(c.id for c in corrections)]
+            )
+        )
+        valid_ids = set(base_sv.derived_from.get("demonstrations", [])) | set(correction_sources)
         cleaned = validate_skill_payload(data, valid_ids=valid_ids)
 
         changes = _validate_changes(data.get("changes"))
@@ -204,10 +222,9 @@ class CorrectionEngine:
             f"Revised from v{base_version} based on {len(corrections)} user correction(s)."
         )
 
-        new_version = self.store.next_version_number(skill_id)
         sv = SkillVersion(
             skill_id=skill_id,
-            version=new_version,
+            version=0,  # Assigned atomically by save_revision after the LLM returns.
             trigger_conditions=cleaned["trigger_conditions"],
             decision_rules=cleaned["decision_rules"],
             exception_handling=cleaned["exception_handling"],
@@ -219,14 +236,10 @@ class CorrectionEngine:
             status="candidate",
             derived_from={
                 "demonstrations": list(base_sv.derived_from.get("demonstrations", [])),
-                "corrections": [c.id for c in corrections],
+                "corrections": correction_sources,
             },
         )
-        self.store.add_skill_version(sv)
-        for c in corrections:
-            self.store.mark_correction_applied(c.id, new_version)
-
-        return sv
+        return self.store.save_revision(sv, [c.id for c in corrections])
 
     # ------------------------------------------------------------------
     # approve / rollback

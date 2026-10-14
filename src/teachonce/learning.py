@@ -240,6 +240,7 @@ def validate_skill_payload(data: dict[str, Any], *, valid_ids: set[str]) -> dict
         )
 
     rules: list[DecisionRule] = []
+    rule_ids: set[str] = set()
     dropped_sources: list[str] = []
     for item in data.get("decision_rules", []) or []:
         if not isinstance(item, dict):
@@ -248,6 +249,16 @@ def validate_skill_payload(data: dict[str, Any], *, valid_ids: set[str]) -> dict
         decision = str(item.get("decision", "")).strip()
         if not condition or not decision:
             continue
+        rule_id = item.get("id")
+        if rule_id is not None:
+            if not isinstance(rule_id, str) or not rule_id.strip():
+                raise SchemaValidationError("Decision rule 'id' must be a non-empty string.")
+            rule_id = rule_id.strip()
+            if rule_id in rule_ids:
+                raise SchemaValidationError(
+                    f"Duplicate decision rule id '{rule_id}'. Use a unique id for each rule."
+                )
+            rule_ids.add(rule_id)
         sources_raw = [str(s) for s in item.get("sources", []) or []]
         sources = [s for s in sources_raw if s in valid_ids]
         dropped_sources.extend(s for s in sources_raw if s not in valid_ids)
@@ -257,6 +268,7 @@ def validate_skill_payload(data: dict[str, Any], *, valid_ids: set[str]) -> dict
             confidence = 0.5
         rules.append(
             DecisionRule.create(
+                rule_id=rule_id,
                 condition=condition,
                 decision=decision,
                 rationale=str(item.get("rationale", "")).strip(),

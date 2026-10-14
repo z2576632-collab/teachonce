@@ -12,7 +12,7 @@ formerly ``FastMCP``).
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from mcp.server.mcpserver import MCPServer
 
@@ -114,6 +114,43 @@ def build_server(
     # ------------------------------------------------------------------
     # read
     # ------------------------------------------------------------------
+
+    @mcp.tool()
+    def teachonce_list_demonstrations() -> dict[str, Any]:
+        """Retrieve saved demonstrations and their ids to resume learning.
+
+        Local-only: no LLM or API key is needed. Use the returned ids with
+        teachonce_generate_skill, including after restarting the server.
+        """
+        demonstrations = [demo.to_dict() for demo in the_store.list_demonstrations()]
+        return {"demonstrations": demonstrations, "count": len(demonstrations)}
+
+    @mcp.tool()
+    def teachonce_list_corrections(
+        skill_id: str, status: Literal["open", "applied"] | None = None
+    ) -> dict[str, Any]:
+        """Retrieve a skill's saved feedback without an LLM.
+
+        Use status='open' to find feedback awaiting revision; omit it for
+        the full history, including the version where feedback was applied.
+        """
+        the_store.get_skill(skill_id)
+        corrections = [
+            correction.to_dict()
+            for correction in the_store.list_corrections(skill_id, status=status)
+        ]
+        return {"corrections": corrections, "count": len(corrections)}
+
+    @mcp.tool()
+    def teachonce_list_evaluations(skill_id: str) -> dict[str, Any]:
+        """Retrieve saved version evaluations without rerunning or using an LLM.
+
+        Includes per-case verdicts, evaluation method and limitations so
+        the user can review evidence before approving a candidate version.
+        """
+        the_store.get_skill(skill_id)
+        reports = [report.to_dict() for report in the_store.list_eval_reports(skill_id)]
+        return {"reports": reports, "count": len(reports)}
 
     @mcp.tool()
     def teachonce_list_skills() -> dict[str, Any]:

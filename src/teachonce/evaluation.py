@@ -80,8 +80,10 @@ class SkillEvaluator:
         ``cases``: ``[{"situation": ..., "expected_decision": ...,
         "keywords": [...] (optional, used by heuristic)}]``.
         """
-        if not cases:
+        if not isinstance(cases, list) or not cases:
             raise SchemaValidationError("Evaluation needs at least one held-out case.")
+        for idx, case in enumerate(cases):
+            _validate_case(case, idx)
         if method == "auto":
             method = "llm_judge" if self.llm is not None else "heuristic"
         if method not in ("llm_judge", "heuristic"):
@@ -99,7 +101,6 @@ class SkillEvaluator:
 
         results: list[dict[str, Any]] = []
         for idx, case in enumerate(cases):
-            _validate_case(case, idx)
             ok_a, detail_a = self._verdict(sv_a, case, method)
             ok_b, detail_b = self._verdict(sv_b, case, method)
             results.append(
@@ -126,7 +127,8 @@ class SkillEvaluator:
             score_a=score_a,
             score_b=score_b,
             results=results,
-            notes=notes.strip() or _DEFAULT_NOTES[method],
+            notes=_DEFAULT_NOTES[method]
+            + (f"\nUser notes: {notes.strip()}" if notes.strip() else ""),
         )
         self.store.save_eval_report(report)
         return report
@@ -143,9 +145,19 @@ class SkillEvaluator:
         user_prompt = _format_judge_prompt(sv, case)
         raw = self.llm.complete(_JUDGE_SYSTEM_PROMPT, user_prompt, json_mode=True)
         data = parse_json_response(raw)
-        supported = bool(data.get("matches_expected", False))
-        predicted = str(data.get("predicted_decision", "")).strip()
-        reasoning = str(data.get("reasoning", "")).strip()
+        supported = data.get("matches_expected")
+        if not isinstance(supported, bool):
+            raise SchemaValidationError(
+                "Evaluation 'matches_expected' must be a JSON boolean (true/false), "
+                "not a string or number. Retry the evaluation."
+            )
+        predicted = data.get("predicted_decision")
+        reasoning = data.get("reasoning")
+        if not isinstance(predicted, str) or not predicted.strip():
+            raise SchemaValidationError("Evaluation needs a non-empty 'predicted_decision' string.")
+        if not isinstance(reasoning, str) or not reasoning.strip():
+            raise SchemaValidationError("Evaluation needs a non-empty 'reasoning' string.")
+        predicted, reasoning = predicted.strip(), reasoning.strip()
         detail = f"predicted: {predicted}" + (f" | {reasoning}" if reasoning else "")
         return supported, detail
 
@@ -158,10 +170,16 @@ class SkillEvaluator:
 def _validate_case(case: dict[str, Any], idx: int) -> None:
     if not isinstance(case, dict):
         raise SchemaValidationError(f"Case #{idx} must be an object.")
-    if not str(case.get("situation", "")).strip():
-        raise SchemaValidationError(f"Case #{idx} needs a non-empty 'situation'.")
-    if not str(case.get("expected_decision", "")).strip():
-        raise SchemaValidationError(f"Case #{idx} needs a non-empty 'expected_decision'.")
+    for field in ("situation", "expected_decision"):
+        value = case.get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise SchemaValidationError(f"Case #{idx} needs a non-empty '{field}' string.")
+    keywords = case.get("keywords")
+    if keywords is not None and (
+        not isinstance(keywords, list)
+        or any(not isinstance(word, str) or not word.strip() for word in keywords)
+    ):
+        raise SchemaValidationError(f"Case #{idx} 'keywords' must be a list of non-empty strings.")
 
 
 def _heuristic_verdict(sv: SkillVersion, case: dict[str, Any]) -> tuple[bool, str]:
