@@ -351,6 +351,70 @@ def build_server(
             "content": content,
         }
 
+    # ------------------------------------------------------------------
+    # adapters (optional third-party integrations)
+    # ------------------------------------------------------------------
+
+    @mcp.tool()
+    def teachonce_optimize_skill(
+        skill_id: str,
+        cases: list[dict[str, Any]],
+        base_version: int | None = None,
+        max_metric_calls: int = 30,
+    ) -> dict[str, Any]:
+        """Evolve a skill's decision rules with GEPA against held-out cases.
+
+        Uses the optional GEPA adapter (pip install "teachonce[gepa]").
+        The result is ALWAYS a candidate version: review it, evaluate it
+        against the base, and approve it explicitly like any revision.
+        ``cases`` must be genuinely held-out (never used for learning).
+        """
+        from .adapters.gepa_optimizer import optimize_skill_rules
+
+        outcome = optimize_skill_rules(
+            the_store,
+            get_llm(),
+            skill_id,
+            cases,
+            base_version=base_version,
+            max_metric_calls=max_metric_calls,
+        )
+        return {
+            "skill_id": skill_id,
+            "base_version": outcome.base_version,
+            "new_version": outcome.new_version.to_dict(),
+            "best_score": outcome.best_score,
+            "metric_calls_budget": outcome.metric_calls_budget,
+        }
+
+    @mcp.tool()
+    def teachonce_import_gui_recording(
+        recording_path: str,
+        task_goal: str = "",
+        context: str = "",
+        outcome: str = "",
+        tags: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Import an OpenAdapt GUI recording export as a demonstration.
+
+        REQUIRES explicit opt-in: set TEACHCONE_GUI_OBSERVATION=1 in the
+        server environment first (GUI observation is off by default).
+        Review the export for sensitive content before importing — it is
+        secret-scanned like any demonstration, but you are responsible for
+        what was on screen.
+        """
+        from .adapters.openadapt import import_gui_recording
+
+        demo = import_gui_recording(
+            the_store,
+            recording_path,
+            task_goal=task_goal,
+            context=context,
+            outcome=outcome,
+            tags=tags,
+        )
+        return demo.to_dict()
+
     return mcp
 
 

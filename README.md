@@ -105,6 +105,27 @@ Claude Code 的 `~/.claude.json`，用你实际环境的 Python 绝对路径替�
 | `teachonce_evaluate_versions` | 用未见案例对比两个版本 |
 | `teachonce_list_evaluations` | 读取历史评估的逐例结论与方法局限 |
 | `teachonce_export_skill_md` | 导出 Agent Skills 标准 SKILL.md |
+| `teachonce_optimize_skill` | 用 GEPA 反思进化优化规则（可选，见下） |
+| `teachonce_import_gui_recording` | 导入 OpenAdapt GUI 录制导出（需显式授权，见下） |
+
+### 5. 可选：开源适配器
+
+**GEPA 规则自进化**（[gepa-ai/gepa](https://github.com/gepa-ai/gepa)，MIT，UC Berkeley）：
+
+```bash
+pip install "teachonce[gepa]"   # 装在同一 Python 环境
+```
+
+之后 `teachonce_optimize_skill` 会用 GEPA 的反思进化（reflective evolution）在未见案例上
+自动优化决策规则。优化用的判分是 TeachOnce 自带的 LLM judge，反思模型复用你配置的
+OpenAI 兼容 API。**产物永远是 candidate**——必须人工审批 + 回归评估后才成为 active 版本，
+预算（`max_metric_calls`）显式受控。
+
+**OpenAdapt 录制导入**（[OpenAdaptAI](https://github.com/OpenAdaptAI)，MIT）：
+
+用 `openadapt-capture` 录制一次桌面操作后，把 JSON 导出转成 TeachOnce 示范。
+**默认关闭**：需先设置 `TEACHCONE_GUI_OBSERVATION=1` 显式授权，且导入前请自查导出内容
+（会经敏感信息扫描，但屏幕上放过什么只有你知道）。适配器只读导出文件，不会启动录制。
 
 ### 5. 换一个聊天后继续学习
 
@@ -148,23 +169,27 @@ teachonce/
 
 ## 当前状态
 
-**已实现（v0.1.0 MVP）**
+**已实现（v0.3.0）**
 - ✅ 结构化示范导入（JSON schema 校验 + 敏感信息红灯检查）
 - ✅ 多示范 → Skill 提取（LLM + JSON schema 校验 + 证据标注）
 - ✅ 任务匹配（置信度 + 匹配理由 + 低置信度转人工确认）
 - ✅ 自然语言纠错 → 版本化更新（changelog / 审批 / 回滚）
 - ✅ 未见案例版本评估（LLM 裁判 + 离线启发式两种模式，均如实标注方法论）
-- ✅ MCP Server（14 个工具，含示范 / 纠错 / 评估历史查询）+ Agent Skills `SKILL.md` 导出
+- ✅ MCP Server（16 个工具）+ Agent Skills `SKILL.md` 导出
 - ✅ 多轮纠错保留规则标识和累计证据，版本与纠错状态原子保存
+- ✅ **GEPA 反思进化适配器**：未见案例驱动的规则自动优化（可选 `[gepa]` extra；真实验证见 docs/PRODUCT.md §4.3）
+- ✅ **OpenAdapt 录制导入适配器**：GUI 操作记录转示范（需 `TEACHCONE_GUI_OBSERVATION=1` 显式授权）
 - ✅ SQLite 本地存储，数据默认不出本机
 - ✅ pytest 全套测试 + ruff + GitHub Actions CI
 
 **计划中（未实现，勿在文档中宣称可用）**
-- ⬜ GUI 操作观察 / 屏幕录制接入（计划通过 OpenAdapt 适配器，需用户显式授权）
+- ⬜ GUI 实时屏幕观察（不经导出文件的直接捕获；当前仅支持 openadapt-capture 导出导入）
 - ⬜ 跨任务自动触发（后台 watcher，当前由宿主 Agent 显式调用 MCP 工具）
-- ⬜ Hermes Agent Skill 格式双向同步
-- ⬜ DSPy / GEPA 驱动的规则自动优化
+- ⬜ DSPy / GEPA 驱动的持续自动优化循环（当前优化为单次、人工发起）
 - ⬜ 多用户 / 团队 Skill 共享
+
+**评估后决定不集成**：Hermes Agent（其自进化核心即 DSPy+GEPA，已被我们直接集成 GEPA 覆盖；
+Skill 互操作由 Agent Skills 标准满足——不耦合其仓库）。
 
 ## 安全与隐私原则
 

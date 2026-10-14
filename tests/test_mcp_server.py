@@ -13,7 +13,12 @@ from typing import Any
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 
-from teachonce.errors import NotFoundError
+from teachonce.adapters.openadapt import CONSENT_ENV as GUI_CONSENT_ENV
+from teachonce.errors import (
+    AdapterUnavailableError,
+    ConsentRequiredError,
+    NotFoundError,
+)
 from teachonce.llm import OpenAICompatibleLLM, ScriptedLLM
 from teachonce.mcp_server import build_server
 from teachonce.models import Correction, Demonstration, EvalReport, Skill
@@ -34,6 +39,8 @@ ALL_TOOLS = {
     "teachonce_rollback",
     "teachonce_evaluate_versions",
     "teachonce_export_skill_md",
+    "teachonce_optimize_skill",
+    "teachonce_import_gui_recording",
 }
 
 
@@ -356,3 +363,70 @@ def test_history_tools_return_empty_collections(store):
         "reports": [],
         "count": 0,
     }
+
+
+# ----------------------------------------------------------------------
+# adapter tools (GEPA optimization + OpenAdapt GUI recording import)
+# ----------------------------------------------------------------------
+
+
+def test_gui_recording_tool_requires_consent(store, monkeypatch):
+    monkeypatch.delenv(GUI_CONSENT_ENV, raising=False)
+    mcp = build_server(store=store)
+    with pytest.raises(ToolError) as exc:
+        _call(mcp, "teachonce_import_gui_recording", {"recording_path": "x.json"})
+    assert isinstance(exc.value.__cause__, ConsentRequiredError)
+
+
+def test_gui_recording_tool_imports_after_consent(store, tmp_path, monkeypatch):
+    monkeypatch.setenv(GUI_CONSENT_ENV, "1")
+    recording = tmp_path / "rec.json"
+    recording.write_text(
+        json.dumps(
+            {
+                "name": "整理课程资料",
+                "events": [{"type": "click", "target": "下载文件夹"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    mcp = build_server(store=store)
+    out = _call(
+        mcp,
+        "teachonce_import_gui_recording",
+        {"recording_path": str(recording)},
+    )
+    assert out["task_goal"] == "整理课程资料"
+    assert _call(mcp, "teachonce_list_demonstrations")["count"] == 1
+
+
+def test_optimize_tool_reports_missing_gepa_package(store, monkeypatch):
+    from teachonce.adapters import gepa_optimizer
+    from teachonce.models import DecisionRule, SkillVersion
+
+    monkeypatch.setattr(gepa_optimizer, "gepa_available", lambda: False)
+    mcp = build_server(store=store, llm=ScriptedLLM([]))
+    skill = Skill.create("Skill")
+    store.create_skill(skill)
+    store.add_skill_version(
+        SkillVersion(
+            skill_id=skill.id,
+            version=1,
+            trigger_conditions=["触发条件"],
+            decision_rules=[
+                DecisionRule.create("条件", "决策", rationale="理由", rule_id="rule_1")
+            ],
+            status="approved",
+        )
+    )
+    store.set_active_version(skill.id, 1)
+    with pytest.raises(ToolError) as exc:
+        _call(
+            mcp,
+            "teachonce_optimize_skill",
+            {
+                "skill_id": skill.id,
+                "cases": [{"situation": "s", "expected_decision": "d"}],
+            },
+        )
+    assert isinstance(exc.value.__cause__, AdapterUnavailableError)

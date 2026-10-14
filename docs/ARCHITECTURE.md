@@ -15,8 +15,9 @@ TeachOnce 是一个**纯 Python 库 + MCP Server**，无独立 UI、无后台常
                 ▼                             ▼
 ┌───────────────────────────────┐   ┌─────────────────────┐
 │   mcp_server.py (MCPServer)   │   │  skill_export.py    │
-│  14 个工具：导入/生成/匹配/     │   │  SKILL.md 标准导出   │
-│  纠错/审批/回滚/评估/导出       │   └─────────────────────┘
+│  16 个工具：导入/生成/匹配/     │   │  SKILL.md 标准导出   │
+│  纠错/审批/回滚/评估/导出/      │   └─────────────────────┘
+│  历史/优化/GUI 导入            │
 └───────┬───────────────────────┘              ▲
         │ 编排（无业务逻辑）                     │
         ▼                                       │
@@ -132,7 +133,7 @@ LLMProvider (ABC)
 
 ## 7. MCP 接口（`mcp_server.py`，MCPServer）
 
-工具面（14 个，全部纯编排调用引擎层或存储层）：
+工具面（16 个，全部纯编排调用引擎层、存储层或适配器层）：
 
 | 工具 | 引擎调用 |
 |---|---|
@@ -148,6 +149,8 @@ LLMProvider (ABC)
 | `teachonce_evaluate_versions` | evaluation.evaluate |
 | `teachonce_list_evaluations` | store.list_eval_reports（包含方法局限和逐例结论） |
 | `teachonce_export_skill_md` | skill_export |
+| `teachonce_optimize_skill` | adapters.gepa_optimizer（可选 `[gepa]` extra；产物恒为 candidate） |
+| `teachonce_import_gui_recording` | adapters.openadapt（需 `TEACHCONE_GUI_OBSERVATION=1`） |
 
 传输：stdio（默认）。返回值一律为 JSON-able dict；错误以异常抛出（MCP 会转为工具错误），不吞错。
 历史查询为本地只读操作，不初始化 LLM。重启后只要连接同一数据库即可恢复；查询结果返回给宿主 Agent。
@@ -157,10 +160,17 @@ LLMProvider (ABC)
 输出标准 `SKILL.md`（YAML frontmatter: `name` / `description` + Markdown 正文：适用条件 / 决策规则 / 异常处理 / 反面模式 / 版本与来源）。
 frontmatter 手写序列化（避免引入 PyYAML）；保证其他兼容 Agent 可直接导入。
 
-## 9. 适配器层（计划中，未实现）
+## 9. 适配器层（已实现 2 个，可选依赖）
 
-- `adapters/openadapt.py` — GUI 观察/示范采集（需显式授权）；`adapters/hermes.py` — Skill 互操作。
-- 设计约束：适配器只做协议转换，核心引擎不感知外部 Agent 类型；未集成前文档不得宣称可用。
+第三方项目一律经适配器隔离接入：**核心引擎不 import 适配器**，只有 `mcp_server.py` 编排层懒加载调用。
+第三方包是可选 extra（`pip install "teachonce[gepa]"`），缺失时报 `AdapterUnavailableError` 并给出确切安装命令——核心库与 CI 不需要它们。
+
+| 适配器 | 状态 | 设计 |
+|---|---|---|
+| `adapters/gepa_optimizer.py` | ✅ 已实现 | GEPA `optimize_anything` 进化规则文本；判分复用自有 LLM judge（`evaluation.py`）；反思模型用 `_ReflectionLM` 包装自有 `OpenAICompatibleLLM`（实现 GEPA `LanguageModel` 协议，不引入 litellm）；优化后由 LLM 重构回结构化 schema 存为 **candidate**；预算（`max_metric_calls`）显式；changelog 记录来源与预算 |
+| `adapters/openadapt.py` | ✅ 已实现（导入部分） | openadapt-capture 的 JSON 导出 → `Demonstration`，走正常学习管道（含敏感信息扫描）；**调用时检查** `TEACHCONE_GUI_OBSERVATION=1`，否则 `ConsentRequiredError`；适配器只读导出文件，不启动录制、不挂钩输入设备；低信号事件（鼠标移动等）跳过并在 context 中计数，不静默丢弃 |
+
+实时屏幕观察（不经导出文件的直接捕获）仍未实现，属计划中，需另行显式授权设计。
 
 ## 10. 安全设计
 

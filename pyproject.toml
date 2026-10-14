@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "teachonce"
-version = "0.2.0"
+version = "0.3.0"
 description = "Teach your AI once. Let it learn how you work. — A personal work-experience learning engine exposed via Agent Skills + MCP."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -28,6 +28,12 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "ruff>=0.6",
+]
+# Optional adapter extras (AGENTS.md §8 — third-party projects are plugged in
+# via isolated adapters, never hard dependencies of the core library):
+gepa = [
+    # GEPA reflective prompt/rules evolution (MIT, UC Berkeley).
+    "gepa>=0.1.4,<0.2",
 ]
 
 [project.scripts]

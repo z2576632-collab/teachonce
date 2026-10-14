@@ -1,7 +1,7 @@
 # PRODUCT.md — TeachOnce 产品定位与方向
 
 > **本文件是产品方向的唯一基准。任何开发前先读本文件，任何产品行为变更同步更新本文件。**
-> 最后更新：2026-10-14（MVP 连续学习与历史恢复）
+> 最后更新：2026-10-14（开源适配器：GEPA 自进化优化 + OpenAdapt 录制导入）
 
 ## 1. 一句话定位
 
@@ -43,6 +43,10 @@
 - **绝不允许**把未经确认的错误经验直接固化为规则。
 - 多轮修订保留规则 ID 和累计纠错来源；纠错仅用于所属 Skill，已应用反馈不会被重复消费。
 - 新版本和纠错状态在同一事务中保存，并发或写入失败时保持一致；候选版仍需人工审批。
+- **GEPA 反思进化**（可选能力）：用未见案例驱动规则自动优化（`teachonce_optimize_skill`）。
+  优化预算显式受控；产物是 **candidate**，与纠错修订一样必须人工审批 + 回归评估后才能生效——
+  自动优化永远不直接改变 active 版本。首次真实验证（DeepSeek，预算 10 次）：v1 规则在未见案例上
+  0/4，进化一轮后新增 3 条正确规则、覆盖 2/4——能力方向验证通过，**非效果宣称**。
 
 ### 4.4 主动识别与接手
 识别当前任务与个人 Skill 的匹配关系，在合理权限内使用经验；**不匹配或高风险任务向用户确认**，不硬套旧流程。
@@ -54,12 +58,13 @@
 
 原则：**不重复造轮子；使用前核查 API / 维护状态 / 许可证（须与 MIT 兼容）/ 技术适配成本；优先适配器接入，避免深度耦合。**
 
-| 项目 | 拟复用的能力 | 状态（2026-10-13） | 备注 |
+| 项目 | 拟复用的能力 | 状态（2026-10-14） | 备注 |
 |---|---|---|---|
-| OpenAdapt / openadapt-agent | GUI 操作观察、示范记录、工作流执行、MCP 接入 | ⬜ 未集成（评估中） | 计划作为「GUI 观察适配器」；需显式授权；MVP 不依赖 |
-| Hermes Agent | Skill 创建/更新/经验持久化 | ⬜ 未集成（评估中） | 计划作为「Skill 格式互操作目标」 |
-| Hermes Agent Self-Evolution | Skill 优化与评测 | ⬜ 未集成（评估中） | 与自研 `evaluation.py` 对照参考 |
-| DSPy / GEPA | 评估与优化 Skill | ⬜ 未集成（可选） | 后期用于决策规则自动优化实验 |
+| GEPA（gepa-ai/gepa） | 决策规则反思进化（自进化引擎） | ✅ 已集成 | `adapters/gepa_optimizer.py`，`optimize_anything` + 自有 LLM 判分；产物恒为 candidate，需人工审批；可选依赖 `teachonce[gepa]` |
+| OpenAdapt / openadapt-capture | GUI 操作观察、示范记录 | 🔶 部分集成 | 录制导出 JSON → Demonstration 导入已实现（`adapters/openadapt.py`），需 `TEACHCONE_GUI_OBSERVATION=1` 显式授权；录制由 openadapt-capture CLI 完成，实时观察未集成 |
+| Hermes Agent（NousResearch） | Skill 创建/更新/经验持久化 | ⛔ 评估完成：不集成 | 其自进化核心即 DSPy+GEPA 优化 SKILL.md——已被 GEPA 直接集成覆盖（更底层、不耦合其仓库）；Skill 格式互操作由 Agent Skills 标准满足 |
+| Hermes Agent Self-Evolution | Skill 优化与评测 | ⛔ 评估完成：不集成 | 同上；其"进化产物走 PR 人工审查"原则已被我们的 candidate→审批门采纳 |
+| DSPy | 评估与优化 Skill | ⛔ 不需要 | GEPA 提供 `optimize_anything` 独立 API，无需引入 DSPy 全家桶 |
 | Agent Skills 标准 | Skill 可移植格式 | ✅ 已采用 | `skill_export.py` 输出标准 `SKILL.md` |
 | MCP Python SDK | 标准 MCP 接口 | ✅ 已采用 | v2 `MCPServer`（原 `FastMCP`），`mcp_server.py` |
 
