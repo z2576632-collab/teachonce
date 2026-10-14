@@ -1,0 +1,5 @@
+# Normalize to LF in the repository (CI runs on Linux; dev on Windows).
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.pdf binary
