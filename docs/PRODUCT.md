@@ -1,7 +1,7 @@
 # PRODUCT.md — TeachOnce 产品定位与方向
 
 > **本文件是产品方向的唯一基准。任何开发前先读本文件，任何产品行为变更同步更新本文件。**
-> 最后更新：2026-10-14（调优/评估案例隔离、优化来源继承和严格裁判校验）
+> 最后更新：2026-10-15（0.4 受控试用：Codex 宿主提案、证据审批、盲测、执行反馈及安装包）
 
 ## 1. 一句话定位
 
@@ -60,17 +60,41 @@
 
 原则：**不重复造轮子；使用前核查 API / 维护状态 / 许可证（须与 MIT 兼容）/ 技术适配成本；优先适配器接入，避免深度耦合。**
 
-| 项目 | 拟复用的能力 | 状态（2026-10-14） | 备注 |
+| 项目 | 拟复用的能力 | 状态（2026-10-15） | 备注 |
 |---|---|---|---|
 | GEPA（gepa-ai/gepa） | 决策规则反思进化（自进化引擎） | ✅ 已集成 | `adapters/gepa_optimizer.py`，`optimize_anything` + 自有 LLM 判分；产物恒为 candidate，需人工审批；可选依赖 `teachonce[gepa]` |
-| OpenAdapt / openadapt-capture | GUI 操作观察、示范记录 | 🔶 部分集成 | 录制导出 JSON → Demonstration 导入已实现（`adapters/openadapt.py`），需 `TEACHCONE_GUI_OBSERVATION=1` 显式授权；录制由 openadapt-capture CLI 完成，实时观察未集成 |
-| Hermes Agent（NousResearch） | Skill 创建/更新/经验持久化 | ⛔ 评估完成：不集成 | 其自进化核心即 DSPy+GEPA 优化 SKILL.md——已被 GEPA 直接集成覆盖（更底层、不耦合其仓库）；Skill 格式互操作由 Agent Skills 标准满足 |
-| Hermes Agent Self-Evolution | Skill 优化与评测 | ⛔ 评估完成：不集成 | 同上；其"进化产物走 PR 人工审查"原则已被我们的 candidate→审批门采纳 |
+| OpenAdapt / openadapt-capture | GUI 操作观察、示范记录 | 🔶 仅预处理事件 JSON | `adapters/openadapt.py` 接受显式转换的 actions/events JSON，需 `TEACHONCE_GUI_OBSERVATION=1`；原生录制是 SQLite/视频目录，尚未接入其 CaptureSession API，不能宣称原生录制已集成 |
+| Hermes Agent（NousResearch） | Skill 创建/更新/经验持久化 | 暂不直接集成 | 通用 Agent 不作为核心运行依赖；Skill 格式采用 Agent Skills，实际跨 Agent 行为仍须分别验收，不宣称已覆盖 Hermes 的全部能力 |
+| Hermes Agent Self-Evolution | Skill 优化与评测 | 参考、未集成 | 独立上游项目的 Phase 1 使用 DSPy+GEPA 优化 Skill；本项目直接采用 GEPA，不等同于集成该仓库；其 PR 审阅思路作为候选审批的设计参考 |
 | DSPy | 评估与优化 Skill | ⛔ 不需要 | GEPA 提供 `optimize_anything` 独立 API，无需引入 DSPy 全家桶 |
 | Agent Skills 标准 | Skill 可移植格式 | ✅ 已采用 | `skill_export.py` 输出标准 `SKILL.md` |
 | MCP Python SDK | 标准 MCP 接口 | ✅ 已采用 | v2 `MCPServer`（原 `FastMCP`），`mcp_server.py` |
 
+本轮核查：[OpenAdapt Capture README](https://github.com/OpenAdaptAI/openadapt-capture#readme)
+描述原生录制目录和 `CaptureSession.load/actions`，其许可证为 MIT；
+[Hermes Self-Evolution README](https://github.com/NousResearch/hermes-agent-self-evolution#readme)
+区分已实现的 Phase 1 与计划阶段，仓库 MIT，另有可选 AGPL Darwinian CLI。
+本项目未安装录制器或 Darwinian，也未把这些上游能力写成自身交付。
+
 **自主开发（不外包的核心）**：个人经验学习（`learning.py`）、决策规则迁移（`matching.py`）、持续改进（`correction.py` + `evaluation.py`）。
+
+## 5.1 0.4 交付边界
+
+- 首个宿主为 Codex。包内 TeachOnce Skill 指导工具组合；CLI 提供诊断、stdio 探测、
+  配置生成、安装 Skill、学习、审阅、审批、回滚和导出，交互 Demo 随 wheel 分发。
+- 两条明确推理路径：API Provider 真实请求；或 Codex 等宿主读取证据并提交结构化 proposal。
+  后者无需额外 API Key，服务只校验与保存，标注 host-proposal，不冒充调用模型或自动返回答案。
+- 新版本必须先评估，逐例通过后由用户批准具体版本与报告。批准比较当前 active/候选，
+  初版比较 v1/v1；审阅展示实际字段差异。状态、active 指针和审计原子更新，冲突时要求重审。
+- `confirmed` 是宿主声明已取得批准，不验证人类身份；Codex 配置把审批与回滚工具设为 prompt。
+- 默认语义评估改为 llm_blind：决策先不接收期望答案，再由另一次调用比较；保留旧 llm_judge。
+  无 API 的 heuristic 只检查文本/管道，不得当作独立语义验收。盲测也不证明真实执行成功率。
+- 宿主执行报告可保存和恢复，明确标为未独立验证。显式反馈关联 open correction，
+  不自动修订或启用 Skill；更新仍需候选、独立评估和人工审阅。
+- 新 `TEACHONCE_*` 环境变量优先，旧 `TEACHCONE_*` 兼容。新增表保留既有数据；旧记录
+  缺失的审批历史、优化指纹不能补造。原有无证据 approve 调用会明确报错。
+
+现阶段为受控试用，实际用户验收和跨 Agent 行为证据需继续积累，见 [READINESS.md](READINESS.md)。
 
 ## 6. MVP 目标与验收标准
 
@@ -97,7 +121,7 @@
 - ✅ 是「从未见过的案例上，AI 能依据学到的决策规则给出正确判断；纠错后 v2 在回归集上不劣于 v1 且修复了被纠错的问题」。
 - 评估与优化输入在调用模型前整批校验并扫描敏感信息；批内重复情境拒绝处理。
   二者裁判的通过 / 不通过结果必须是 JSON 布尔值，预测和理由必须是非空字符串；异常输出不计分、不落库。
-- 报告始终携带所用方法的局限（包括用户补充备注时）。当前 LLM 裁判属于规则支持性判断，
+- 报告始终携带所用方法的局限（包括用户补充备注时）。盲测比较先行预测，旧裁判检查规则支持性，
   不是独立的真实执行成功率测试。系统会检查评估案例与两个版本已记录 GEPA 调优案例的
   规范化情境指纹是否重叠，改变期望答案或案例 ID 不能绕过检查，重启后仍有效。
   尚不能识别同义改写、示范/纠错的语义重叠，旧优化版本可能缺少指纹；未见案例仍须
@@ -107,9 +131,11 @@
 
 - 不记录或公开真实密码、Token、Cookie 等敏感信息（导入时红灯拦截）。
 - GUI 操作记录需用户明确授权，属计划中能力。
-- 不自动执行未授权的危险文件操作（TeachOnce 自身不写用户文件系统）。
+- 不自动执行未授权的危险文件操作，不移动/删除/覆盖待整理资料；本地学习库及明确请求的 Skill 导出/安装会写入对应目录。
 - Skill 更新提供变更说明，支持人工审批和回滚。
 - 个人操作记录默认本地保存（`~/.teachonce/`），不默认公开。
+- 无遥测；上下文返回宿主，配置 API 推理时内容发送至指定端点。本地持久化不等于完全本地计算。
+  凭据扫描是补充防线，用户仍需在导入前脱敏；原始远程错误正文不得回显到日志。
 - 所有能力必须真实实现，不允许硬编码输出伪装成功；文档严格区分已实现与计划。
 
 ## 8. 术语表

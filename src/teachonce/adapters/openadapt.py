@@ -1,8 +1,8 @@
-"""OpenAdapt adapter — GUI recording exports become Demonstrations.
+"""Prepared GUI event JSON becomes Demonstrations.
 
 OpenAdapt (https://github.com/OpenAdaptAI, MIT) records native desktop
 demonstrations (screen + input + window evidence) via ``openadapt-capture``.
-This adapter converts a recording **export** (JSON) into a TeachOnce
+This adapter converts explicitly prepared event JSON into a TeachOnce
 Demonstration, which then flows through the normal learning pipeline —
 including the secrets scan in ``learning.import_demonstration``.
 
@@ -18,12 +18,12 @@ Safety red lines (AGENTS.md §5.3, docs/PRODUCT.md §7):
   scanned for secrets at import like any demonstration, but the user is
   responsible for reviewing the export first.
 
-Supported input: the JSON export of an ``openadapt-capture`` recording —
-an object with an action/event list. Field mapping is tolerant
+Supported input: a JSON object with an action/event list. Field mapping accepts
 ("events"/"actions"/"recording"; per-event "type"/"action", "target"/
-"window"/"element", "value"/"text") because OpenAdapt's export schema has
-varied across releases; unmapped events are skipped and counted in the
-returned report so nothing is silently dropped.
+"window"/"element", "value"/"text"). These aliases are TeachOnce's input
+contract, not a verified upstream export schema. Native openadapt-capture
+recording folders contain SQLite/video and are NOT supported here; an explicit
+conversion is required. Unmapped events are skipped and counted in context.
 """
 
 from __future__ import annotations
@@ -48,7 +48,10 @@ _IGNORED_EVENT_TYPES = {"mouse_move", "mousemove", "move", "scroll", "hover"}
 def gui_observation_consented(env: dict[str, str] | None = None) -> bool:
     """Whether the user has explicitly opted in to GUI observation."""
     source = env if env is not None else os.environ
-    return source.get(CONSENT_ENV, "").strip().lower() in _CONSENT_VALUES
+    return (
+        source.get("TEACHONCE_GUI_OBSERVATION", source.get(CONSENT_ENV, "")).strip().lower()
+        in _CONSENT_VALUES
+    )
 
 
 def require_gui_consent(env: dict[str, str] | None = None) -> None:
@@ -71,7 +74,7 @@ def import_gui_recording(
     outcome: str = "",
     tags: list[str] | None = None,
 ) -> Demonstration:
-    """Convert an OpenAdapt recording export into a stored Demonstration.
+    """Convert prepared event JSON into a stored Demonstration.
 
     ``recording``: path to a JSON export, or the already-parsed dict.
     ``task_goal``: what the user was accomplishing (falls back to the
@@ -123,8 +126,9 @@ def _load_recording(recording: str | Path | dict[str, Any]) -> dict[str, Any]:
         data = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise SchemaValidationError(
-            f"Recording export is not valid JSON: {exc}. Export the recording "
-            "from openadapt-capture as JSON and retry."
+            f"Recording export is not valid JSON: {exc}. Prepare an event JSON "
+            "object with an actions/events list. Native SQLite/video recordings "
+            "require explicit conversion and cannot be imported directly."
         ) from exc
     if not isinstance(data, dict):
         raise SchemaValidationError("Recording export must be a JSON object.")
@@ -143,7 +147,7 @@ def _event_list(data: dict[str, Any]) -> list[dict[str, Any]]:
             return _event_list(nested)
     raise SchemaValidationError(
         "Recording export has no 'events'/'actions' list. Expected an "
-        "openadapt-capture JSON export; check the export format version."
+        "prepared event JSON object; native recording folders are not supported."
     )
 
 

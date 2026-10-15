@@ -172,7 +172,7 @@ def _revision_response(demo_ids: list[str], correction_id: str) -> str:
     )
 
 
-def test_full_pipeline(store):
+def test_full_pipeline(store, reviewed_approval):
     # --- learning ------------------------------------------------------
     # (responses 2-4 are callables / built later; keep FIFO order intact)
     llm = ScriptedLLM([])
@@ -192,7 +192,7 @@ def test_full_pipeline(store):
     assert v1.decision_rules[0].sources == demo_ids[:2]  # grounded evidence
 
     correcting = CorrectionEngine(store, llm)
-    correcting.approve_version(skill.id, 1)
+    reviewed_approval(correcting, skill.id, 1)
     assert store.get_active_version(skill.id).version == 1
 
     # --- matching ------------------------------------------------------
@@ -223,7 +223,7 @@ def test_full_pipeline(store):
     assert len(v1_reloaded.decision_rules) == 4
     assert v1_reloaded.status == "approved"
 
-    correcting.approve_version(skill.id, 2)
+    reviewed_approval(correcting, skill.id, 2)
     assert store.get_skill(skill.id).active_version == 2
 
     # --- evaluation on held-out cases -----------------------------------
@@ -234,7 +234,7 @@ def test_full_pipeline(store):
     assert report.score_b == 1.0  # v2 passes all
     assert report.results[2]["supported_a"] is False
     assert report.results[2]["supported_b"] is True
-    assert len(store.list_eval_reports(skill.id)) == 1
+    assert len(store.list_eval_reports(skill.id)) == 3
 
     # --- export ----------------------------------------------------------
     active = store.get_active_version(skill.id)
@@ -250,6 +250,8 @@ def test_full_pipeline(store):
     assert "rollback" not in content.lower() or True  # sections render
 
     # --- rollback sanity -------------------------------------------------
-    correcting.rollback_to(skill.id, 1)
+    correcting.rollback_to(
+        skill.id, 1, confirmed=True, reviewer="test human", reason="Review rollback"
+    )
     assert store.get_skill(skill.id).active_version == 1
     assert store.get_skill_version(skill.id, 2).status == "rolled_back"

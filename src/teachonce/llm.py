@@ -15,15 +15,18 @@ Configuration (environment variables):
 from __future__ import annotations
 
 import json
+import math
 import re
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
 from .errors import LLMError, LLMNotConfiguredError, SchemaValidationError
+from .security import ensure_no_secrets
 
 
 class LLMProvider(ABC):
@@ -45,7 +48,7 @@ class LLMProvider(ABC):
 class LLMConfig:
     """Resolved LLM configuration."""
 
-    api_key: str | None = None
+    api_key: str | None = field(default=None, repr=False)
     base_url: str = "https://api.openai.com/v1"
     model: str = "gpt-4o-mini"
     timeout_s: float = 120.0
@@ -56,11 +59,17 @@ class LLMConfig:
 
         source = env if env is not None else os.environ
         return cls(
-            api_key=source.get("TEACHCONE_LLM_API_KEY") or None,
-            base_url=(source.get("TEACHCONE_LLM_BASE_URL") or "https://api.openai.com/v1").rstrip(
-                "/"
-            ),
-            model=source.get("TEACHCONE_LLM_MODEL") or "gpt-4o-mini",
+            api_key=source.get("TEACHONCE_LLM_API_KEY")
+            or source.get("TEACHCONE_LLM_API_KEY")
+            or None,
+            base_url=(
+                source.get("TEACHONCE_LLM_BASE_URL")
+                or source.get("TEACHCONE_LLM_BASE_URL")
+                or "https://api.openai.com/v1"
+            ).rstrip("/"),
+            model=source.get("TEACHONCE_LLM_MODEL")
+            or source.get("TEACHCONE_LLM_MODEL")
+            or "gpt-4o-mini",
         )
 
 
@@ -72,6 +81,22 @@ class OpenAICompatibleLLM(LLMProvider):
     """
 
     def __init__(self, config: LLMConfig) -> None:
+        endpoint = urlsplit(config.base_url)
+        if (
+            endpoint.scheme not in ("https", "http")
+            or not endpoint.hostname
+            or endpoint.username
+            or endpoint.password
+            or endpoint.query
+            or endpoint.fragment
+        ):
+            raise LLMError("Use a plain HTTP(S) base URL without credentials, query or fragment.")
+        if endpoint.scheme == "http" and endpoint.hostname not in ("localhost", "127.0.0.1", "::1"):
+            raise LLMError(
+                "Remote LLM endpoints require HTTPS. HTTP is allowed only for localhost."
+            )
+        if not math.isfinite(config.timeout_s) or config.timeout_s <= 0:
+            raise LLMError("LLM timeout must be a finite positive number.")
         if not config.api_key:
             raise LLMNotConfiguredError(
                 "No LLM API key configured. Set TEACHCONE_LLM_API_KEY "
@@ -113,11 +138,10 @@ class OpenAICompatibleLLM(LLMProvider):
         def _post(body: dict[str, Any]) -> httpx.Response:
             try:
                 return httpx.post(url, headers=headers, json=body, timeout=self.config.timeout_s)
-            except httpx.HTTPError as exc:
+            except httpx.HTTPError:
                 raise LLMError(
-                    f"LLM request to {url} failed: {exc}. Check your network / "
-                    "TEACHCONE_LLM_BASE_URL."
-                ) from exc
+                    "LLM request failed. Check the network and TEACHONCE_LLM_BASE_URL."
+                ) from None
 
         response = _post(payload)
         if response.status_code == 400 and json_mode:
@@ -126,17 +150,22 @@ class OpenAICompatibleLLM(LLMProvider):
             payload.pop("response_format", None)
             response = _post(payload)
         if response.status_code != 200:
-            snippet = response.text[:500]
             raise LLMError(
-                f"LLM API returned HTTP {response.status_code}: {snippet}. "
+                f"LLM API returned HTTP {response.status_code}. "
                 f"Check TEACHCONE_LLM_API_KEY / TEACHCONE_LLM_MODEL (current "
-                f"model: {self.config.model})."
+                "model setting). Response contents are omitted to protect credentials."
             )
         try:
             data = response.json()
-            return str(data["choices"][0]["message"]["content"])
-        except (KeyError, IndexError, ValueError) as exc:
-            raise LLMError(f"Unexpected LLM response shape: {response.text[:500]}") from exc
+            content = data["choices"][0]["message"]["content"]
+            if not isinstance(content, str) or not content.strip():
+                raise ValueError("Expected non-empty text")
+            ensure_no_secrets(content, where="model response")
+            return content
+        except (KeyError, IndexError, ValueError, TypeError):
+            raise LLMError(
+                "Unexpected LLM response shape; expected non-empty message text."
+            ) from None
 
 
 @dataclass
@@ -193,11 +222,14 @@ def parse_json_response(text: str) -> dict[str, Any]:
     prose wrapped around the object. Raises
     :class:`SchemaValidationError` if no JSON object can be recovered.
     """
+    ensure_no_secrets(text, where="model response")
     candidate = text.strip()
     if candidate.startswith("```"):
         candidate = _FENCE_RE.sub("", candidate).strip()
     try:
-        parsed = json.loads(candidate)
+        parsed = json.loads(
+            candidate, object_pairs_hook=_unique_keys, parse_constant=_invalid_number
+        )
         if isinstance(parsed, dict):
             return parsed
         raise SchemaValidationError(f"Expected a JSON object, got {type(parsed).__name__}.")
@@ -208,12 +240,29 @@ def parse_json_response(text: str) -> dict[str, Any]:
     end = text.rfind("}")
     if start != -1 and end > start:
         try:
-            parsed = json.loads(text[start : end + 1])
+            parsed = json.loads(
+                text[start : end + 1],
+                object_pairs_hook=_unique_keys,
+                parse_constant=_invalid_number,
+            )
             if isinstance(parsed, dict):
                 return parsed
         except json.JSONDecodeError:
             pass
 
     raise SchemaValidationError(
-        f"LLM response did not contain a parseable JSON object. First 200 chars: {text[:200]!r}"
+        "LLM response did not contain a parseable JSON object. Retry with structured JSON output."
     )
+
+
+def _unique_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise SchemaValidationError("Model JSON contains duplicate keys; retry the request.")
+        result[key] = value
+    return result
+
+
+def _invalid_number(value: str) -> None:
+    raise SchemaValidationError("Model JSON contains a non-finite number; retry the request.")

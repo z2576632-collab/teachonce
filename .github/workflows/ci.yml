@@ -10,10 +10,11 @@ permissions:
 
 jobs:
   lint-and-test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest, windows-latest]
         python-version: ["3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
@@ -38,3 +39,23 @@ jobs:
         run: pytest -q
         # No API keys are provided to CI by design: the whole suite runs
         # against ScriptedLLM. Real-API verification is the demo's job.
+
+  wheel-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build wheel
+        run: python -m pip wheel --no-deps --wheel-dir dist .
+      - name: Verify clean installed distribution outside source checkout
+        shell: bash
+        run: |
+          python -m venv "$RUNNER_TEMP/teachonce-smoke"
+          "$RUNNER_TEMP/teachonce-smoke/bin/python" -m pip install dist/*.whl
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/teachonce-smoke/bin/teachonce" doctor
+          "$RUNNER_TEMP/teachonce-smoke/bin/teachonce" probe
+          "$RUNNER_TEMP/teachonce-smoke/bin/teachonce" install-skill --dest "$RUNNER_TEMP/teachonce-skills"
+          "$RUNNER_TEMP/teachonce-smoke/bin/teachonce" demo --help

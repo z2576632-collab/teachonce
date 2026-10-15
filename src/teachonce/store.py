@@ -112,6 +112,25 @@ CREATE TABLE IF NOT EXISTS match_logs (
     payload_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS activation_events (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    skill_id TEXT NOT NULL REFERENCES skills(id),
+    from_version INTEGER,
+    to_version INTEGER NOT NULL,
+    event TEXT NOT NULL,
+    evaluation_id TEXT,
+    reviewer TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS outcomes (
+    id TEXT PRIMARY KEY,
+    skill_id TEXT NOT NULL REFERENCES skills(id),
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 """
 
 
@@ -136,7 +155,7 @@ def default_db_path() -> Path:
     ``TEACHCONE_HOME`` overrides the base directory (useful for tests and
     demo sandboxes); otherwise ``~/.teachonce``.
     """
-    home = os.environ.get("TEACHCONE_HOME")
+    home = os.environ.get("TEACHONCE_HOME") or os.environ.get("TEACHCONE_HOME")
     base = Path(home) if home else Path.home() / ".teachonce"
     return base / "teachonce.db"
 
@@ -158,6 +177,12 @@ class SkillStore:
     @_locked
     def close(self) -> None:
         self._conn.close()
+
+    def __enter__(self) -> SkillStore:
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        self.close()
 
     # ------------------------------------------------------------------
     # demonstrations
@@ -217,6 +242,21 @@ class SkillStore:
         return skill.id
 
     @_locked
+    def create_skill_with_version(self, skill: Skill, sv: SkillVersion) -> None:
+        """Save a new aggregate atomically; a failed version leaves no orphan skill."""
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._conn.execute(
+                "INSERT INTO skills VALUES (?, ?, ?, ?, ?, ?)",
+                (skill.id, skill.name, skill.description, None, skill.created_at, skill.updated_at),
+            )
+            self._insert_skill_version(sv)
+            self._conn.commit()
+        except BaseException:
+            self._conn.rollback()
+            raise
+
+    @_locked
     def get_skill(self, skill_id: str) -> Skill:
         row = self._conn.execute("SELECT * FROM skills WHERE id = ?", (skill_id,)).fetchone()
         if row is None:
@@ -271,6 +311,19 @@ class SkillStore:
     def add_skill_version(self, sv: SkillVersion) -> None:
         self._insert_skill_version(sv)
         self._conn.commit()
+
+    @_locked
+    def save_candidate(self, sv: SkillVersion) -> SkillVersion:
+        """Allocate and append a candidate atomically across connections."""
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            saved = replace(sv, version=self.next_version_number(sv.skill_id), status="candidate")
+            self._insert_skill_version(saved)
+            self._conn.commit()
+            return saved
+        except BaseException:
+            self._conn.rollback()
+            raise
 
     def _insert_skill_version(self, sv: SkillVersion) -> None:
         """Insert without committing; callers hold the connection lock."""
@@ -380,12 +433,83 @@ class SkillStore:
         )
         self._conn.commit()
 
+    @_locked
+    def activate_version(
+        self,
+        skill_id: str,
+        version: int,
+        *,
+        expected_active: int | None,
+        expected_status: str,
+        event: str,
+        evaluation_id: str | None,
+        reviewer: str,
+        reason: str,
+    ) -> Skill:
+        """Atomically update activation/status and audit a validated review decision."""
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            skill = self.get_skill(skill_id)
+            target = self.get_skill_version(skill_id, version)
+            if skill.active_version != expected_active or target.status != expected_status:
+                raise VersionStateError(
+                    "Activation changed during review. Reload and review again."
+                )
+            if event == "rollback" and expected_active is not None and expected_active != version:
+                self._conn.execute(
+                    "UPDATE skill_versions SET status='rolled_back' WHERE skill_id=? AND version=?",
+                    (skill_id, expected_active),
+                )
+            self._conn.execute(
+                "UPDATE skill_versions SET status='approved' WHERE skill_id=? AND version=?",
+                (skill_id, version),
+            )
+            self._conn.execute(
+                "UPDATE skills SET active_version=?,updated_at=? WHERE id=?",
+                (version, utc_now(), skill_id),
+            )
+            self._conn.execute(
+                "INSERT INTO activation_events(skill_id,from_version,to_version,event,"
+                "evaluation_id,reviewer,reason,created_at) VALUES (?,?,?,?,?,?,?,?)",
+                (
+                    skill_id,
+                    expected_active,
+                    version,
+                    event,
+                    evaluation_id,
+                    reviewer,
+                    reason,
+                    utc_now(),
+                ),
+            )
+            self._conn.commit()
+        except BaseException:
+            self._conn.rollback()
+            raise
+        return self.get_skill(skill_id)
+
+    @_locked
+    def list_activation_events(self, skill_id: str) -> list[dict[str, Any]]:
+        """Read persistent human approval/rollback history."""
+        self.get_skill(skill_id)
+        return [
+            dict(row)
+            for row in self._conn.execute(
+                "SELECT * FROM activation_events WHERE skill_id=? ORDER BY sequence", (skill_id,)
+            )
+        ]
+
     # ------------------------------------------------------------------
     # corrections
     # ------------------------------------------------------------------
 
     @_locked
     def add_correction(self, correction: Correction) -> str:
+        self._insert_correction(correction)
+        self._conn.commit()
+        return correction.id
+
+    def _insert_correction(self, correction: Correction) -> None:
         self._conn.execute(
             "INSERT INTO corrections (id, skill_id, target_version, feedback,"
             " correction_type, analysis, status, applied_in_version, created_at)"
@@ -402,8 +526,6 @@ class SkillStore:
                 correction.created_at,
             ),
         )
-        self._conn.commit()
-        return correction.id
 
     @_locked
     def get_correction(self, correction_id: str) -> Correction:
@@ -413,6 +535,39 @@ class SkillStore:
         if row is None:
             raise NotFoundError(f"Correction '{correction_id}' not found.")
         return _row_to_correction(row)
+
+    @_locked
+    def save_outcome(self, outcome: dict[str, Any], correction: Correction | None = None) -> None:
+        """Atomically persist host evidence and any associated open correction."""
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            if correction:
+                self._insert_correction(correction)
+            self._conn.execute(
+                "INSERT INTO outcomes VALUES (?,?,?,?)",
+                (
+                    outcome["id"],
+                    outcome["skill_id"],
+                    json.dumps(outcome, ensure_ascii=False),
+                    outcome["created_at"],
+                ),
+            )
+            self._conn.commit()
+        except BaseException:
+            self._conn.rollback()
+            raise
+
+    @_locked
+    def list_outcomes(self, skill_id: str) -> list[dict[str, Any]]:
+        """Read original reported outcomes without scoring or reinterpreting them."""
+        self.get_skill(skill_id)
+        return [
+            json.loads(row["payload_json"])
+            for row in self._conn.execute(
+                "SELECT payload_json FROM outcomes WHERE skill_id=? ORDER BY created_at",
+                (skill_id,),
+            )
+        ]
 
     @_locked
     def list_corrections(self, skill_id: str, *, status: str | None = None) -> list[Correction]:
@@ -485,6 +640,18 @@ class SkillStore:
                 )
             )
         return reports
+
+    @_locked
+    def get_eval_report(self, report_id: str) -> EvalReport:
+        """Read a previously saved evaluation by immutable ID."""
+        row = self._conn.execute(
+            "SELECT skill_id FROM eval_reports WHERE id=?", (report_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFoundError("Evaluation not found. Evaluate the candidate before approving it.")
+        return next(
+            report for report in self.list_eval_reports(row["skill_id"]) if report.id == report_id
+        )
 
     # ------------------------------------------------------------------
     # match logs

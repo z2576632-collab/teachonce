@@ -19,6 +19,7 @@ from mcp.server.mcpserver import MCPServer
 from .correction import CorrectionEngine
 from .errors import LLMNotConfiguredError
 from .evaluation import SkillEvaluator
+from .feedback import FeedbackEngine
 from .learning import LearningEngine
 from .llm import LLMProvider, OpenAICompatibleLLM
 from .matching import SkillMatcher
@@ -88,6 +89,7 @@ def build_server(
         name: str,
         demonstration_ids: list[str],
         description: str = "",
+        proposal: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Extract a candidate skill (trigger conditions, decision rules,
         exceptions) from one or more imported demonstrations.
@@ -95,8 +97,10 @@ def build_server(
         The result is a CANDIDATE version: review it, then call
         teachonce_approve_version to make it active.
         """
-        engine = LearningEngine(the_store, get_llm())
-        skill, sv = engine.extract_candidate_skill(name, demonstration_ids, description=description)
+        engine = LearningEngine(the_store, get_llm() if proposal is None else None)
+        skill, sv = engine.extract_candidate_skill(
+            name, demonstration_ids, description=description, proposal=proposal
+        )
         return {
             "skill_id": skill.id,
             "name": skill.name,
@@ -109,7 +113,27 @@ def build_server(
             "anti_patterns": sv.anti_patterns,
             "open_questions": sv.open_questions,
             "changelog": sv.changelog,
+            "inference_source": "host-proposal" if proposal is not None else "api-model",
         }
+
+    @mcp.tool()
+    def teachonce_learning_context(name: str, demonstration_ids: list[str]) -> dict[str, Any]:
+        """Read evidence and output instructions for host inference, without an API key."""
+        return LearningEngine(the_store).learning_context(name, demonstration_ids)
+
+    @mcp.tool()
+    def teachonce_revision_context(
+        skill_id: str, base_version: int | None = None, correction_ids: list[str] | None = None
+    ) -> dict[str, Any]:
+        """Read the exact base and pending feedback for a host-generated revision proposal."""
+        return CorrectionEngine(the_store).revision_context(
+            skill_id, base_version=base_version, correction_ids=correction_ids
+        )
+
+    @mcp.tool()
+    def teachonce_matching_context(task: str) -> dict[str, Any]:
+        """Read the approved catalog and planning instructions for host inference."""
+        return SkillMatcher(the_store).matching_context(task)
 
     # ------------------------------------------------------------------
     # read
@@ -204,15 +228,17 @@ def build_server(
     # ------------------------------------------------------------------
 
     @mcp.tool()
-    def teachonce_match_skill(task: str, skill_ids: list[str] | None = None) -> dict[str, Any]:
+    def teachonce_match_skill(
+        task: str, skill_ids: list[str] | None = None, proposal: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         """Match a new task against learned skills.
 
         Returns the best match with confidence, rationale, an advisory plan
         and whether human confirmation is required. This NEVER executes the
         task — the host agent executes after the user's permission.
         """
-        matcher = SkillMatcher(the_store, get_llm())
-        result = matcher.match(task, skill_ids=skill_ids)
+        matcher = SkillMatcher(the_store, get_llm() if proposal is None else None)
+        result = matcher.match(task, skill_ids=skill_ids, proposal=proposal)
         return result.to_dict()
 
     # ------------------------------------------------------------------
@@ -224,6 +250,7 @@ def build_server(
         skill_id: str,
         feedback: str,
         target_version: int | None = None,
+        classification: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Record a natural-language correction about a skill version.
 
@@ -231,8 +258,10 @@ def build_server(
         too_broad / too_narrow / other) and stored as an open correction.
         Apply it later with teachonce_apply_correction.
         """
-        engine = CorrectionEngine(the_store, get_llm())
-        correction = engine.record_correction(skill_id, feedback, target_version=target_version)
+        engine = CorrectionEngine(the_store, get_llm() if classification is None else None)
+        correction = engine.record_correction(
+            skill_id, feedback, target_version=target_version, classification=classification
+        )
         return correction.to_dict()
 
     @mcp.tool()
@@ -240,6 +269,7 @@ def build_server(
         skill_id: str,
         base_version: int | None = None,
         correction_ids: list[str] | None = None,
+        proposal: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Apply open corrections and produce a REVISED candidate version.
 
@@ -247,9 +277,9 @@ def build_server(
         changelog; the old versions stay intact. Review the changelog, then
         approve with teachonce_approve_version.
         """
-        engine = CorrectionEngine(the_store, get_llm())
+        engine = CorrectionEngine(the_store, get_llm() if proposal is None else None)
         sv = engine.apply_correction(
-            skill_id, base_version=base_version, correction_ids=correction_ids
+            skill_id, base_version=base_version, correction_ids=correction_ids, proposal=proposal
         )
         return {
             "skill_id": sv.skill_id,
@@ -262,11 +292,30 @@ def build_server(
         }
 
     @mcp.tool()
-    def teachonce_approve_version(skill_id: str, version: int) -> dict[str, Any]:
+    def teachonce_review_version(skill_id: str, version: int) -> dict[str, Any]:
+        """Read candidate content, eligible evaluations and activation history for human review."""
+        return CorrectionEngine(the_store).review_version(skill_id, version)
+
+    @mcp.tool()
+    def teachonce_approve_version(
+        skill_id: str,
+        version: int,
+        evaluation_id: str = "",
+        confirmed: bool = False,
+        reviewer: str = "",
+        reason: str = "",
+    ) -> dict[str, Any]:
         """Human approval: mark a candidate version as approved and make it
         the active version used by matching."""
         engine = CorrectionEngine(the_store)
-        skill = engine.approve_version(skill_id, version)
+        skill = engine.approve_version(
+            skill_id,
+            version,
+            evaluation_id=evaluation_id,
+            confirmed=confirmed,
+            reviewer=reviewer,
+            reason=reason,
+        )
         return {
             "skill_id": skill.id,
             "name": skill.name,
@@ -275,14 +324,18 @@ def build_server(
         }
 
     @mcp.tool()
-    def teachonce_rollback(skill_id: str, version: int) -> dict[str, Any]:
+    def teachonce_rollback(
+        skill_id: str, version: int, confirmed: bool = False, reviewer: str = "", reason: str = ""
+    ) -> dict[str, Any]:
         """Roll the active pointer back to a previously approved version.
 
         The abandoned active version is marked 'rolled_back'; nothing is
         deleted and its content never changes.
         """
         engine = CorrectionEngine(the_store)
-        skill = engine.rollback_to(skill_id, version)
+        skill = engine.rollback_to(
+            skill_id, version, confirmed=confirmed, reviewer=reviewer, reason=reason
+        )
         return {
             "skill_id": skill.id,
             "name": skill.name,
@@ -310,13 +363,13 @@ def build_server(
         records the method and its limitations.
         """
         evaluator = SkillEvaluator(the_store)
-        if method in ("auto", "llm_judge"):
+        if method in ("auto", "llm_judge", "llm_blind"):
             # Resolve lazily; "auto" falls back to the offline heuristic
             # when no LLM is configured, while "llm_judge" must raise.
             try:
                 evaluator.llm = get_llm()
             except LLMNotConfiguredError:
-                if method == "llm_judge":
+                if method in ("llm_judge", "llm_blind"):
                     raise
                 evaluator.llm = None
         report = evaluator.evaluate(skill_id, version_a, version_b, cases, method=method)
@@ -417,12 +470,35 @@ def build_server(
         )
         return demo.to_dict()
 
+    @mcp.tool()
+    def teachonce_record_outcome(
+        skill_id: str, version: int, task: str, status: str, summary: str, feedback: str = ""
+    ) -> dict[str, Any]:
+        """Store the host's actual reported result, never claim independent execution verification.
+
+        status: succeeded|failed|partial|cancelled. Explicit feedback creates an
+        open correction; outcomes never activate skills or automatically rewrite rules.
+        """
+        return FeedbackEngine(the_store).record_outcome(
+            skill_id, version, task, status, summary, feedback=feedback
+        )
+
+    @mcp.tool()
+    def teachonce_list_outcomes(skill_id: str) -> dict[str, Any]:
+        """Read saved host-reported successes/failures and linked open feedback without a model."""
+        outcomes = the_store.list_outcomes(skill_id)
+        return {"outcomes": outcomes, "count": len(outcomes)}
+
     return mcp
 
 
 def main() -> None:
     """Entry point for ``teachonce-mcp`` (stdio transport)."""
-    build_server().run()
+    store = SkillStore()
+    try:
+        build_server(store=store).run()
+    finally:
+        store.close()
 
 
 if __name__ == "__main__":

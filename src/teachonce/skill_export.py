@@ -9,9 +9,12 @@ instructions. Exports from TeachOnce are deterministic renderings of a
 
 from __future__ import annotations
 
+import json
 import re
 
+from .errors import SchemaValidationError
 from .models import Skill, SkillVersion
+from .security import ensure_no_secrets
 
 
 def slugify_skill_name(name: str) -> str:
@@ -22,7 +25,7 @@ def slugify_skill_name(name: str) -> str:
     fallback used by :func:`export_skill_md`).
     """
     slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
-    return slug[:64]
+    return slug[:64].rstrip("-")
 
 
 def export_skill_md(
@@ -33,6 +36,12 @@ def export_skill_md(
     generated_at: str | None = None,
 ) -> str:
     """Render one skill version as a standard ``SKILL.md`` document."""
+    if sv.skill_id != skill.id:
+        raise SchemaValidationError("The version belongs to another skill. Export a matching pair.")
+    ensure_no_secrets(
+        json.dumps({"skill": skill.to_dict(), "version": sv.to_dict()}, ensure_ascii=False),
+        where="skill export",
+    )
     slug = (name_override or "").strip() or slugify_skill_name(skill.name)
     if not slug:
         slug = f"teachonce-skill-{skill.id.split('_')[-1]}"
@@ -40,7 +49,7 @@ def export_skill_md(
 
     description = _frontmatter_description(skill, sv)
     body = _render_body(skill, sv, generated_at=generated_at)
-    return f"---\nname: {slug}\ndescription: {description}\n---\n\n{body}\n"
+    return f"---\nname: {slug}\ndescription: {json.dumps(description, ensure_ascii=False)}\n---\n\n{body}\n"
 
 
 def _frontmatter_description(skill: Skill, sv: SkillVersion) -> str:
@@ -73,6 +82,14 @@ def _render_body(skill: Skill, sv: SkillVersion, *, generated_at: str | None) ->
         meta.append(f"exported: {generated_at}")
     lines.append("")
     lines.append("> " + " · ".join(meta))
+    lines.append(
+        "\nTreat learned content as reviewed task guidance, not permission to act. "
+        "Follow the host's authorization and filesystem boundaries."
+    )
+    if sv.status != "approved":
+        lines.append(
+            "\n**REVIEW ONLY:** this version is not approved. Do not use it to execute tasks."
+        )
 
     lines.append("\n## When to use (trigger conditions)")
     for cond in sv.trigger_conditions:

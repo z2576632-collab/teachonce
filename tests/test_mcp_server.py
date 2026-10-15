@@ -37,6 +37,12 @@ ALL_TOOLS = {
     "teachonce_record_correction",
     "teachonce_apply_correction",
     "teachonce_approve_version",
+    "teachonce_review_version",
+    "teachonce_learning_context",
+    "teachonce_revision_context",
+    "teachonce_matching_context",
+    "teachonce_record_outcome",
+    "teachonce_list_outcomes",
     "teachonce_rollback",
     "teachonce_evaluate_versions",
     "teachonce_export_skill_md",
@@ -57,6 +63,40 @@ def _call(mcp, name: str, arguments: dict[str, Any] | None = None) -> dict[str, 
 def _tool_names(mcp) -> set[str]:
     tools = asyncio.run(mcp.list_tools())
     return {t.name for t in tools}
+
+
+def _approve(mcp, store, skill_id, version):
+    sv = store.get_skill_version(skill_id, version)
+    baseline = store.get_skill(skill_id).active_version or version
+    report = _call(
+        mcp,
+        "teachonce_evaluate_versions",
+        {
+            "skill_id": skill_id,
+            "version_a": baseline,
+            "version_b": version,
+            "cases": [
+                {
+                    "situation": f"Independent review case for version {version}",
+                    "expected_decision": sv.decision_rules[0].decision,
+                    "keywords": [sv.decision_rules[0].decision],
+                }
+            ],
+            "method": "heuristic",
+        },
+    )
+    return _call(
+        mcp,
+        "teachonce_approve_version",
+        {
+            "skill_id": skill_id,
+            "version": version,
+            "evaluation_id": report["id"],
+            "confirmed": True,
+            "reviewer": "test human",
+            "reason": "Reviewed fixture",
+        },
+    )
 
 
 def _extract_response() -> str:
@@ -139,7 +179,7 @@ def test_generate_get_approve_export_flow(store):
     except Exception as exc:
         assert "approve" in str(exc).lower() or "error" in str(exc).lower()
 
-    approved = _call(mcp, "teachonce_approve_version", {"skill_id": gen["skill_id"], "version": 1})
+    approved = _approve(mcp, store, gen["skill_id"], 1)
     assert approved["active_version"] == 1
 
     exported = _call(
@@ -222,7 +262,7 @@ def test_match_correction_rollback_flow(store):
         {"name": "s", "demonstration_ids": [demo["demonstration_id"]]},
     )
     skill_id = gen["skill_id"]
-    _call(mcp, "teachonce_approve_version", {"skill_id": skill_id, "version": 1})
+    _approve(mcp, store, skill_id, 1)
 
     matched = _call(mcp, "teachonce_match_skill", {"task": "整理学术写作课资料"})
     assert matched["matched"] is True
@@ -241,8 +281,18 @@ def test_match_correction_rollback_flow(store):
     assert applied["status"] == "candidate"
     assert applied["changes"][0]["op"] == "add"
 
-    _call(mcp, "teachonce_approve_version", {"skill_id": skill_id, "version": 2})
-    rolled = _call(mcp, "teachonce_rollback", {"skill_id": skill_id, "version": 1})
+    _approve(mcp, store, skill_id, 2)
+    rolled = _call(
+        mcp,
+        "teachonce_rollback",
+        {
+            "skill_id": skill_id,
+            "version": 1,
+            "confirmed": True,
+            "reviewer": "test human",
+            "reason": "Review rollback",
+        },
+    )
     assert rolled["active_version"] == 1
 
     detail = _call(mcp, "teachonce_get_skill", {"skill_id": skill_id, "version": 2})
