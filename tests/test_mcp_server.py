@@ -18,6 +18,7 @@ from teachonce.errors import (
     AdapterUnavailableError,
     ConsentRequiredError,
     NotFoundError,
+    SchemaValidationError,
 )
 from teachonce.llm import OpenAICompatibleLLM, ScriptedLLM
 from teachonce.mcp_server import build_server
@@ -430,3 +431,95 @@ def test_optimize_tool_reports_missing_gepa_package(store, monkeypatch):
             },
         )
     assert isinstance(exc.value.__cause__, AdapterUnavailableError)
+
+
+def test_mcp_optimization_requires_independent_evaluation_cases(store, monkeypatch):
+    from teachonce.adapters import gepa_optimizer
+
+    def fake_optimizer(**kwargs):
+        return {"best_candidate": "Keep course folders"}
+
+    # Only replace GEPA's optimization step. MCP, restructuring, persistence
+    # and evaluation run through their real implementations with a test LLM.
+    monkeypatch.setattr(gepa_optimizer, "_default_optimize_fn", lambda llm: fake_optimizer)
+    llm = ScriptedLLM([_extract_response(), _extract_response()])
+    mcp = build_server(store=store, llm=llm)
+    demo = _call(
+        mcp,
+        "teachonce_import_demonstration",
+        {
+            "task_goal": "Organize course notes",
+            "steps": [{"action": "Group by course"}],
+        },
+    )
+    generated = _call(
+        mcp,
+        "teachonce_generate_skill",
+        {
+            "name": "Courses",
+            "demonstration_ids": [demo["demonstration_id"]],
+        },
+    )
+    cases = [{"situation": "A tuning course", "expected_decision": "按课程分文件夹"}]
+    optimized = _call(
+        mcp,
+        "teachonce_optimize_skill",
+        {
+            "skill_id": generated["skill_id"],
+            "cases": cases,
+            "base_version": 1,
+        },
+    )
+    assert optimized["new_version"]["status"] == "candidate"
+    assert optimized["score_scope"] == "tuning" and optimized["best_score"] is None
+    assert optimized["new_version"]["derived_from"]["optimization_cases"]
+    llm_calls = len(llm.calls)
+    with pytest.raises(ToolError) as exc:
+        _call(
+            mcp,
+            "teachonce_evaluate_versions",
+            {
+                "skill_id": generated["skill_id"],
+                "version_a": 1,
+                "version_b": 2,
+                "cases": cases,
+                "method": "llm_judge",
+            },
+        )
+    assert isinstance(exc.value.__cause__, SchemaValidationError)
+    assert len(llm.calls) == llm_calls
+    assert (
+        _call(
+            mcp,
+            "teachonce_list_evaluations",
+            {
+                "skill_id": generated["skill_id"],
+            },
+        )["count"]
+        == 0
+    )
+    report = _call(
+        mcp,
+        "teachonce_evaluate_versions",
+        {
+            "skill_id": generated["skill_id"],
+            "version_a": 1,
+            "version_b": 2,
+            "cases": [
+                {"situation": "Independent new course", "expected_decision": "按课程分文件夹"}
+            ],
+            "method": "heuristic",
+        },
+    )
+    assert "Case isolation" in report["notes"]
+    assert (
+        _call(
+            mcp,
+            "teachonce_list_evaluations",
+            {
+                "skill_id": generated["skill_id"],
+            },
+        )["count"]
+        == 1
+    )
+    assert store.get_skill(generated["skill_id"]).active_version is None

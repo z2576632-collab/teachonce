@@ -17,6 +17,7 @@ from teachonce.errors import (
     LLMNotConfiguredError,
     NotFoundError,
     SchemaValidationError,
+    SensitiveContentError,
 )
 from teachonce.llm import ScriptedLLM
 from teachonce.models import DecisionRule, Skill, SkillVersion
@@ -190,3 +191,149 @@ def test_missing_gepa_package_raises_actionable_error(monkeypatch):
     monkeypatch.setattr(gepa_optimizer, "gepa_available", lambda: False)
     with pytest.raises(AdapterUnavailableError, match=r"teachonce\[gepa\]"):
         gepa_optimizer._require_gepa()
+
+
+def test_optimization_cases_cannot_be_reused_as_held_out_after_restart(store):
+    from teachonce.evaluation import SkillEvaluator
+    from teachonce.store import SkillStore
+
+    skill_id = _setup_skill(store)
+    outcome = optimize_skill_rules(
+        store, _judge_then_restructure_llm(), skill_id, CASES, optimize_fn=_fake_optimize
+    )
+    reopened = SkillStore(store.db_path)
+    try:
+        llm = ScriptedLLM([])
+        with pytest.raises(SchemaValidationError, match="optimization"):
+            SkillEvaluator(reopened, llm).evaluate(skill_id, 1, outcome.new_version.version, CASES)
+        assert not llm.calls
+        assert reopened.list_eval_reports(skill_id) == []
+    finally:
+        reopened.close()
+
+
+@pytest.mark.parametrize("field", ["predicted_decision", "reasoning"])
+@pytest.mark.parametrize("value", [None, "  ", 42, {}])
+def test_optimization_judge_rejects_invalid_text_without_saving(store, field, value):
+    skill_id = _setup_skill(store)
+    response = {"matches_expected": True, "predicted_decision": "考试资料/", "reasoning": "ok"}
+    response[field] = value
+    llm = ScriptedLLM([json.dumps(response)])
+    with pytest.raises(SchemaValidationError, match=field):
+        optimize_skill_rules(store, llm, skill_id, CASES, optimize_fn=_fake_optimize)
+    assert len(store.list_skill_versions(skill_id)) == 1
+
+
+@pytest.mark.parametrize("verdict", ["true", "false", 0, 1, None])
+def test_optimization_judge_requires_boolean(store, verdict):
+    skill_id = _setup_skill(store)
+    llm = ScriptedLLM(
+        [
+            json.dumps(
+                {
+                    "matches_expected": verdict,
+                    "predicted_decision": "Keep",
+                    "reasoning": "ok",
+                }
+            )
+        ]
+    )
+    with pytest.raises(SchemaValidationError, match="JSON boolean"):
+        optimize_skill_rules(store, llm, skill_id, CASES, optimize_fn=_fake_optimize)
+    assert len(store.list_skill_versions(skill_id)) == 1
+
+
+@pytest.mark.parametrize("budget", [0, -1, True, 1.5, "10", None])
+def test_invalid_budget_rejected_before_optimizer_or_llm(store, budget):
+    skill_id = _setup_skill(store)
+    llm = ScriptedLLM([])
+    with pytest.raises(SchemaValidationError, match="positive integer"):
+        optimize_skill_rules(
+            store, llm, skill_id, CASES, max_metric_calls=budget, optimize_fn=_fake_optimize
+        )
+    assert not llm.calls
+
+
+@pytest.mark.parametrize("sensitive", [False, True])
+def test_duplicate_or_sensitive_tuning_cases_rejected_before_optimizer(store, sensitive):
+    skill_id = _setup_skill(store)
+    cases = [CASES[0], {**CASES[0], "expected_decision": "Different answer"}]
+    if sensitive:
+        cases[1] = {"situation": "new", "expected_decision": "password=synthetic-value"}
+    llm = ScriptedLLM([])
+    error = SensitiveContentError if sensitive else SchemaValidationError
+    with pytest.raises(error):
+        optimize_skill_rules(store, llm, skill_id, cases, optimize_fn=_fake_optimize)
+    assert not llm.calls
+    assert len(store.list_skill_versions(skill_id)) == 1
+
+
+def test_multiple_optimizations_and_correction_preserve_case_isolation(store):
+    from teachonce.correction import CorrectionEngine
+    from teachonce.evaluation import SkillEvaluator
+    from teachonce.models import Correction
+
+    skill_id = _setup_skill(store)
+    first = optimize_skill_rules(
+        store, _judge_then_restructure_llm(), skill_id, CASES, optimize_fn=_fake_optimize
+    ).new_version
+    new_cases = [{"situation": "A different tuning situation", "expected_decision": "Keep"}]
+    second = optimize_skill_rules(
+        store,
+        _judge_then_restructure_llm(),
+        skill_id,
+        new_cases,
+        base_version=first.version,
+        optimize_fn=_fake_optimize,
+    ).new_version
+    assert len(second.derived_from["optimization_cases"]) == 3
+    assert set(first.derived_from["optimization_cases"]) < set(
+        second.derived_from["optimization_cases"]
+    )
+    assert len(second.derived_from["optimizations"]) == 2
+
+    feedback = Correction.create(skill_id, second.version, "Keep the course directory structure")
+    store.add_correction(feedback)
+    revised_payload = json.loads(_RESTRUCTURE_RESPONSE)
+    revised_payload["changelog"] = "Retain course folders"
+    revised_payload["changes"] = []
+    corrected = CorrectionEngine(
+        store, ScriptedLLM([json.dumps(revised_payload)])
+    ).apply_correction(
+        skill_id,
+        base_version=second.version,
+    )
+    assert corrected.derived_from["optimization_cases"] == second.derived_from["optimization_cases"]
+    assert corrected.derived_from["optimizations"] == second.derived_from["optimizations"]
+    assert corrected.derived_from["corrections"] == [feedback.id]
+    assert store.get_skill(skill_id).active_version == 1
+
+    # Altering answers, whitespace, Unicode width or IDs cannot disguise tuning cases.
+    disguised = {
+        **new_cases[0],
+        "situation": "  Ａ  different\ntuning situation ",
+        "expected_decision": "Changed answer",
+        "id": "new-id",
+    }
+    llm = ScriptedLLM([])
+    with pytest.raises(SchemaValidationError, match="optimization"):
+        SkillEvaluator(store, llm).evaluate(skill_id, 1, corrected.version, [disguised])
+    assert not llm.calls
+    # Check either compared version, even when the other is the older baseline.
+    with pytest.raises(SchemaValidationError, match="optimization"):
+        SkillEvaluator(store).evaluate(skill_id, corrected.version, 1, CASES, method="heuristic")
+    report = SkillEvaluator(store).evaluate(
+        skill_id,
+        1,
+        corrected.version,
+        [
+            {
+                "situation": "Independent new course exercise",
+                "expected_decision": "考试资料/",
+                "keywords": ["考试资料"],
+            }
+        ],
+        method="heuristic",
+    )
+    assert len(store.list_eval_reports(skill_id)) == 1
+    assert report.results[0]["supported_b"] is True

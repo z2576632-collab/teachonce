@@ -4,7 +4,7 @@ GEPA (https://github.com/gepa-ai/gepa, MIT, UC Berkeley Sky Computing Lab)
 is an LLM-based text evolution engine: it reads *why* candidates fail
 (evaluation feedback), proposes targeted mutations, and keeps Pareto-best
 variants. TeachOnce uses it to optimize the decision rules of an existing
-skill version against held-out cases — the "self-evolution" step of the
+skill version against tuning cases — the "self-evolution" step of the
 learning loop (docs/PRODUCT.md §4.3).
 
 Safety invariants preserved here (non-negotiable, see AGENTS.md §5):
@@ -36,7 +36,12 @@ from ..errors import (
     LLMNotConfiguredError,
     SchemaValidationError,
 )
-from ..evaluation import _JUDGE_SYSTEM_PROMPT, _format_judge_prompt, _validate_case
+from ..evaluation import (
+    _JUDGE_SYSTEM_PROMPT,
+    _format_judge_prompt,
+    _parse_judge_verdict,
+    _validate_cases,
+)
 from ..learning import validate_skill_payload
 from ..llm import LLMProvider, parse_json_response
 from ..models import SkillVersion
@@ -76,7 +81,7 @@ _OBJECTIVE = (
 
 @dataclass
 class OptimizationOutcome:
-    """Result of a GEPA optimization run."""
+    """Result of a GEPA run; best_score is a tuning score, not held-out reliability."""
 
     new_version: SkillVersion
     base_version: int
@@ -112,10 +117,11 @@ def optimize_skill_rules(
     max_metric_calls: int = 30,
     optimize_fn: OptimizeFn | None = None,
 ) -> OptimizationOutcome:
-    """Evolve a skill version's rules with GEPA against held-out cases.
+    """Evolve a skill version's rules with GEPA against tuning cases.
 
-    ``cases`` must be genuinely held-out (never used for learning or
-    correction) — same discipline as ``evaluation.evaluate``.
+    ``cases`` become learning input once used by the optimizer. Reserve
+    separate, independent cases for ``evaluation.evaluate``; normalized
+    situation fingerprints persist with this candidate and its descendants.
 
     The same ``llm`` judges candidates AND powers GEPA's reflective
     mutation (wrapped as GEPA's ``LanguageModel`` protocol — no litellm or
@@ -130,11 +136,8 @@ def optimize_skill_rules(
             "restructuring the result. Configure TEACHCONE_LLM_API_KEY, "
             "then retry."
         )
-    if not isinstance(cases, list) or not cases:
-        raise SchemaValidationError("Optimization needs at least one held-out case.")
-    for idx, case in enumerate(cases):
-        _validate_case(case, idx)
-    if max_metric_calls < 1:
+    case_fingerprints = _validate_cases(cases, purpose="Optimization")
+    if type(max_metric_calls) is not int or max_metric_calls < 1:
         raise SchemaValidationError("max_metric_calls must be a positive integer.")
 
     skill = store.get_skill(skill_id)
@@ -173,7 +176,14 @@ def optimize_skill_rules(
     )
     best_text, best_score = _extract_best(result)
 
-    new_sv = _restructure(llm, store, base_sv, best_text, budget=max_metric_calls)
+    new_sv = _restructure(
+        llm,
+        store,
+        base_sv,
+        best_text,
+        budget=max_metric_calls,
+        case_fingerprints=case_fingerprints,
+    )
 
     return OptimizationOutcome(
         new_version=new_sv,
@@ -196,15 +206,8 @@ def _judge_rules_text(llm: LLMProvider, rules_text: str, case: dict[str, Any]) -
         trigger_conditions=[rules_text],
     )
     raw = llm.complete(_JUDGE_SYSTEM_PROMPT, _format_judge_prompt(surrogate, case), json_mode=True)
-    data = parse_json_response(raw)
-    supported = data.get("matches_expected")
-    if not isinstance(supported, bool):
-        raise SchemaValidationError(
-            "Judge returned a non-boolean 'matches_expected' during optimization. Retry the run."
-        )
-    reasoning = str(data.get("reasoning", "")).strip()
-    predicted = str(data.get("predicted_decision", "")).strip()
-    feedback = reasoning or ("supported" if supported else f"predicted: {predicted}")
+    supported, predicted, reasoning = _parse_judge_verdict(raw)
+    feedback = f"predicted: {predicted} | {reasoning}"
     return (1.0 if supported else 0.0), feedback
 
 
@@ -309,6 +312,7 @@ def _restructure(
     optimized_text: str,
     *,
     budget: int,
+    case_fingerprints: list[str],
 ) -> SkillVersion:
     """Turn optimized rules text into a structured candidate version."""
     user_prompt = (
@@ -337,7 +341,7 @@ def _restructure(
         changelog=(
             f"GEPA reflective optimization of v{base_sv.version} "
             f"(budget: {budget} metric calls). Rules were evolved against "
-            "held-out cases and restructured into the skill schema. "
+            "tuning cases and restructured into the skill schema. "
             "Candidate — requires human approval and regression evaluation "
             "before becoming active."
         ),
@@ -351,9 +355,14 @@ def _restructure(
         ],
         status="candidate",
         derived_from={
-            "demonstrations": list(base_sv.derived_from.get("demonstrations", [])),
-            "corrections": list(base_sv.derived_from.get("corrections", [])),
-            "optimizations": [f"gepa:v{base_sv.version}:budget{budget}"],
+            **{key: list(values) for key, values in base_sv.derived_from.items()},
+            "optimizations": [
+                *base_sv.derived_from.get("optimizations", []),
+                f"gepa:v{base_sv.version}:budget{budget}",
+            ],
+            "optimization_cases": sorted(
+                set(base_sv.derived_from.get("optimization_cases", [])) | set(case_fingerprints)
+            ),
         },
     )
     store.add_skill_version(sv)
