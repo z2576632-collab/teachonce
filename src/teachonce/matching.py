@@ -11,11 +11,14 @@ Safety-first design (docs/PRODUCT.md §4.4):
 
 from __future__ import annotations
 
+import json
+import math
 from typing import Any
 
 from .errors import LLMNotConfiguredError, SchemaValidationError
 from .llm import LLMProvider, parse_json_response
 from .models import MatchResult, Skill, SkillVersion
+from .security import ensure_no_secrets
 from .store import SkillStore
 
 _MATCH_SYSTEM_PROMPT = """\
@@ -103,21 +106,25 @@ class SkillMatcher:
         *,
         skill_ids: list[str] | None = None,
         log: bool = True,
+        proposal: dict[str, Any] | None = None,
     ) -> MatchResult:
         """Select a skill for ``task`` and explain the choice.
 
         Only skills with an approved active version are candidates.
         """
+        if not isinstance(task, str):
+            raise SchemaValidationError("Task description must be a string.")
         task = task.strip()
         if not task:
             raise SchemaValidationError("Task description must not be empty.")
+        ensure_no_secrets(task, where="task")
 
         candidates: list[tuple[Skill, SkillVersion]] = []
         for skill in self.store.list_skills():
             if skill_ids is not None and skill.id not in skill_ids:
                 continue
             active = self.store.get_active_version(skill.id)
-            if active is not None:
+            if active is not None and active.status == "approved":
                 candidates.append((skill, active))
 
         if not candidates:
@@ -137,8 +144,11 @@ class SkillMatcher:
             return result
 
         user_prompt = _format_match_prompt(task, candidates)
-        llm = self._require_llm()
-        raw = llm.complete(_MATCH_SYSTEM_PROMPT, user_prompt, json_mode=True)
+        if proposal is None:
+            llm = self._require_llm()
+            raw = llm.complete(_MATCH_SYSTEM_PROMPT, user_prompt, json_mode=True)
+        else:
+            raw = json.dumps(proposal, ensure_ascii=False)
         data = parse_json_response(raw)
 
         by_id = {skill.id: (skill, sv) for skill, sv in candidates}
@@ -146,11 +156,20 @@ class SkillMatcher:
         matched_id = data.get("matched_skill_id")
         matched_id = str(matched_id) if matched_id else None
 
-        confidence = _clamp01(_to_float(data.get("confidence"), 0.0))
-        rationale = str(data.get("rationale", "")).strip()
+        confidence = data.get("confidence")
+        if (
+            isinstance(confidence, bool)
+            or not isinstance(confidence, (int, float))
+            or not math.isfinite(confidence)
+            or not 0 <= confidence <= 1
+        ):
+            raise SchemaValidationError(
+                "Match confidence must be a finite JSON number from 0 to 1."
+            )
+        rationale = _text(data.get("rationale"), "rationale", required=True)
         plan = _str_list(data.get("plan"))
         missing_info = _str_list(data.get("missing_info"))
-        risk_notes = str(data.get("risk_notes", "")).strip()
+        risk_notes = _text(data.get("risk_notes", ""), "risk_notes")
 
         if matched_id is None or matched_id not in by_id:
             # Includes hallucinated ids — treated as no match, never forced.
@@ -169,8 +188,15 @@ class SkillMatcher:
             return result
 
         skill, active = by_id[matched_id]
+        if proposal is not None and (
+            type(proposal.get("matched_version")) is not int
+            or proposal["matched_version"] != active.version
+        ):
+            raise SchemaValidationError(
+                "Host proposal needs the current matched_version; refresh matching context."
+            )
 
-        flagged = _detect_risk(task)
+        flagged = _detect_risk(task + "\n" + "\n".join(plan))
         if flagged:
             risk_notes = (risk_notes + " " if risk_notes else "") + (
                 f"Task wording mentions potentially destructive operations "
@@ -178,8 +204,17 @@ class SkillMatcher:
             )
 
         requires_confirmation = (
-            confidence < self.confidence_threshold or bool(missing_info) or bool(flagged)
+            confidence < self.confidence_threshold
+            or bool(missing_info)
+            or bool(flagged)
+            or bool(risk_notes)
+            or not plan
         )
+        current = self.store.get_active_version(skill.id)
+        if current is None or current.version != active.version or current.status != "approved":
+            requires_confirmation = True
+            plan = []
+            missing_info.append("Skill activation changed while planning; match the task again.")
 
         result = MatchResult(
             task=task,
@@ -199,6 +234,25 @@ class SkillMatcher:
             self.store.log_match(result)
         return result
 
+    def matching_context(self, task: str) -> dict[str, Any]:
+        """Return the current approved catalog for host-model inference, without executing."""
+        if not isinstance(task, str) or not task.strip():
+            raise SchemaValidationError("Provide a non-empty task description.")
+        ensure_no_secrets(task, where="task")
+        candidates = []
+        for skill in self.store.list_skills():
+            active = self.store.get_active_version(skill.id)
+            if active is not None and active.status == "approved":
+                candidates.append((skill, active))
+        prompt = _format_match_prompt(task, candidates)
+        ensure_no_secrets(prompt, where="matching context")
+        return {
+            "system_prompt": _MATCH_SYSTEM_PROMPT,
+            "user_prompt": prompt,
+            "server_inference_performed": False,
+            "execution_performed": False,
+        }
+
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -210,6 +264,7 @@ def _format_match_prompt(task: str, candidates: list[tuple[Skill, SkillVersion]]
     for skill, sv in candidates:
         lines.append(f"\n## skill id={skill.id}")
         lines.append(f"name: {skill.name}")
+        lines.append(f"version: {sv.version}")
         summary = sv.summary or skill.description
         if summary:
             lines.append(f"summary: {summary}")
@@ -248,6 +303,16 @@ def _clamp01(value: float) -> float:
 
 
 def _str_list(raw: Any) -> list[str]:
-    if not raw or not isinstance(raw, list):
-        return []
-    return [str(x).strip() for x in raw if str(x).strip()]
+    if not isinstance(raw, list) or any(not isinstance(x, str) or not x.strip() for x in raw):
+        raise SchemaValidationError(
+            "Match plan and missing_info must be lists of non-empty strings."
+        )
+    return [x.strip() for x in raw]
+
+
+def _text(raw: Any, field: str, *, required: bool = False) -> str:
+    if not isinstance(raw, str) or (required and not raw.strip()):
+        raise SchemaValidationError(
+            f"Match '{field}' must be {'non-empty ' if required else ''}text."
+        )
+    return raw.strip()

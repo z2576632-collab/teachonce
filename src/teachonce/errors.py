@@ -47,6 +47,10 @@ class VersionStateError(TeachOnceError):
     """
 
 
+class ApprovalRequiredError(VersionStateError):
+    """A reviewed evaluation and explicit human confirmation are required."""
+
+
 class AdapterUnavailableError(TeachOnceError):
     """An optional third-party adapter dependency is not installed.
 

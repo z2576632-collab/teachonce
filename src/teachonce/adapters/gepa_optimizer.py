@@ -183,6 +183,11 @@ def optimize_skill_rules(
         best_text,
         budget=max_metric_calls,
         case_fingerprints=case_fingerprints,
+        activation_base=list(
+            base_sv.derived_from.get("activation_base", [str(skill.active_version)])
+        )
+        if base_sv.status == "candidate"
+        else [str(base_sv.version if skill.active_version is not None else None)],
     )
 
     return OptimizationOutcome(
@@ -313,6 +318,7 @@ def _restructure(
     *,
     budget: int,
     case_fingerprints: list[str],
+    activation_base: list[str],
 ) -> SkillVersion:
     """Turn optimized rules text into a structured candidate version."""
     user_prompt = (
@@ -328,10 +334,9 @@ def _restructure(
     )
     cleaned = validate_skill_payload(data, valid_ids=valid_ids)
 
-    new_version = store.next_version_number(base_sv.skill_id)
     sv = SkillVersion(
         skill_id=base_sv.skill_id,
-        version=new_version,
+        version=0,  # Allocated by save_candidate atomically after the model returns.
         trigger_conditions=cleaned["trigger_conditions"],
         decision_rules=cleaned["decision_rules"],
         exception_handling=cleaned["exception_handling"],
@@ -363,7 +368,8 @@ def _restructure(
             "optimization_cases": sorted(
                 set(base_sv.derived_from.get("optimization_cases", [])) | set(case_fingerprints)
             ),
+            "base_versions": [str(base_sv.version)],
+            "activation_base": activation_base,
         },
     )
-    store.add_skill_version(sv)
-    return sv
+    return store.save_candidate(sv)

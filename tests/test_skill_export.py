@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from teachonce.models import DecisionRule, Skill, SkillVersion
 from teachonce.skill_export import export_skill_md, slugify_skill_name
 
@@ -62,6 +64,7 @@ def test_export_has_frontmatter_and_sections():
 def test_export_cjk_name_with_override():
     skill = Skill.create("课程资料整理")
     _, sv = _skill_and_version()
+    sv = replace(sv, skill_id=skill.id)
     content = export_skill_md(skill, sv, name_override="course-organizing")
     assert "name: course-organizing" in content
 
@@ -69,6 +72,7 @@ def test_export_cjk_name_with_override():
 def test_export_cjk_name_without_override_uses_id_fallback():
     skill = Skill.create("课程资料整理")
     _, sv = _skill_and_version()
+    sv = replace(sv, skill_id=skill.id)
     content = export_skill_md(skill, sv)
     assert f"name: teachonce-skill-{skill.id.split('_')[-1]}" in content
 

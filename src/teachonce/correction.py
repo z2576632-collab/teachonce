@@ -15,6 +15,7 @@ import json
 from typing import Any
 
 from .errors import (
+    ApprovalRequiredError,
     LLMNotConfiguredError,
     NotFoundError,
     SchemaValidationError,
@@ -106,8 +107,11 @@ class CorrectionEngine:
         feedback: str,
         *,
         target_version: int | None = None,
+        classification: dict[str, Any] | None = None,
     ) -> Correction:
         """Classify and store a natural-language correction."""
+        if not isinstance(feedback, str):
+            raise SchemaValidationError("Correction feedback must be text.")
         feedback = feedback.strip()
         if not feedback:
             raise SchemaValidationError("Correction feedback must not be empty.")
@@ -131,20 +135,26 @@ class CorrectionEngine:
             f"# Skill being corrected\nname: {skill.name}\n"
             f"version: v{target_version}\n\n# User feedback\n{feedback}"
         )
-        llm = self._require_llm()
-        raw = llm.complete(_RECORD_SYSTEM_PROMPT, user_prompt, json_mode=True)
+        if classification is None:
+            llm = self._require_llm()
+            raw = llm.complete(_RECORD_SYSTEM_PROMPT, user_prompt, json_mode=True)
+        else:
+            raw = json.dumps(classification, ensure_ascii=False)
         data = parse_json_response(raw)
 
         ctype = str(data.get("correction_type", "other"))
         if ctype not in _VALID_CORRECTION_TYPES:
             ctype = "other"
 
+        analysis = data.get("analysis", "")
+        if not isinstance(analysis, str):
+            raise SchemaValidationError("Correction analysis must be text.")
         correction = Correction.create(
             skill_id=skill_id,
             target_version=target_version,
             feedback=feedback,
             correction_type=ctype,  # type: ignore[arg-type]
-            analysis=str(data.get("analysis", "")).strip(),
+            analysis=("[host proposal] " if classification is not None else "") + analysis.strip(),
         )
         self.store.add_correction(correction)
         return correction
@@ -153,14 +163,14 @@ class CorrectionEngine:
     # apply
     # ------------------------------------------------------------------
 
-    def apply_correction(
+    def revision_context(
         self,
         skill_id: str,
         *,
         base_version: int | None = None,
         correction_ids: list[str] | None = None,
-    ) -> SkillVersion:
-        """Produce a revised candidate version applying open corrections.
+    ) -> dict[str, Any]:
+        """Load and validate pending corrections for host-model revision.
 
         ``base_version`` defaults to the active version, falling back to the
         latest existing version when nothing is approved yet.
@@ -203,10 +213,45 @@ class CorrectionEngine:
             base_version = versions[-1].version
 
         base_sv = self.store.get_skill_version(skill_id, base_version)
-
         user_prompt = _format_apply_prompt(base_sv, corrections)
-        llm = self._require_llm()
-        raw = llm.complete(_APPLY_SYSTEM_PROMPT, user_prompt, json_mode=True)
+        ensure_no_secrets(user_prompt, where="revision context")
+        return {
+            "system_prompt": _APPLY_SYSTEM_PROMPT,
+            "user_prompt": user_prompt,
+            "base": base_sv.to_dict(),
+            "corrections": [c.to_dict() for c in corrections],
+            "server_inference_performed": False,
+            "activation_base": list(
+                base_sv.derived_from.get("activation_base", [str(skill.active_version)])
+            )
+            if base_sv.status == "candidate"
+            else [str(base_sv.version if skill.active_version is not None else None)],
+        }
+
+    def apply_correction(
+        self,
+        skill_id: str,
+        *,
+        base_version: int | None = None,
+        correction_ids: list[str] | None = None,
+        proposal: dict[str, Any] | None = None,
+    ) -> SkillVersion:
+        """Validate API or explicit host inference and atomically save a candidate revision."""
+        if proposal is not None and (base_version is None or correction_ids is None):
+            raise SchemaValidationError(
+                "Host revision proposals require explicit base_version and correction_ids from revision_context."
+            )
+        context = self.revision_context(
+            skill_id, base_version=base_version, correction_ids=correction_ids
+        )
+        base_sv = SkillVersion.from_dict(context["base"])
+        base_version = base_sv.version
+        corrections = [Correction.from_dict(c) for c in context["corrections"]]
+        if proposal is None:
+            llm = self._require_llm()
+            raw = llm.complete(_APPLY_SYSTEM_PROMPT, context["user_prompt"], json_mode=True)
+        else:
+            raw = json.dumps(proposal, ensure_ascii=False)
         data = parse_json_response(raw)
 
         correction_sources = list(
@@ -238,6 +283,22 @@ class CorrectionEngine:
                 **{key: list(values) for key, values in base_sv.derived_from.items()},
                 "demonstrations": list(base_sv.derived_from.get("demonstrations", [])),
                 "corrections": correction_sources,
+                "base_versions": [str(base_version)],
+                "activation_base": context["activation_base"],
+                **(
+                    {
+                        "inference_sources": list(
+                            dict.fromkeys(
+                                [
+                                    *base_sv.derived_from.get("inference_sources", []),
+                                    "host-proposal",
+                                ]
+                            )
+                        )
+                    }
+                    if proposal is not None
+                    else {}
+                ),
             },
         )
         return self.store.save_revision(sv, [c.id for c in corrections])
@@ -246,15 +307,116 @@ class CorrectionEngine:
     # approve / rollback
     # ------------------------------------------------------------------
 
-    def approve_version(self, skill_id: str, version: int) -> Skill:
-        """Human approval: mark version approved and make it the active one."""
-        self.store.get_skill(skill_id)  # existence
-        sv = self.store.get_skill_version(skill_id, version)  # existence
-        self.store.set_version_status(skill_id, sv.version, "approved")
-        self.store.set_active_version(skill_id, sv.version)
-        return self.store.get_skill(skill_id)
+    def review_version(self, skill_id: str, version: int) -> dict[str, Any]:
+        """Prepare candidate content, report eligibility and review history without a model."""
+        skill = self.store.get_skill(skill_id)
+        sv = self.store.get_skill_version(skill_id, version)
+        reports = []
+        for report in self.store.list_eval_reports(skill_id):
+            if report.version_b != version:
+                continue
+            reason = self._report_issue(skill, sv, report)
+            reports.append({**report.to_dict(), "eligible": reason is None, "issue": reason})
+        return {
+            "skill": skill.to_dict(),
+            "candidate": sv.to_dict(),
+            "baseline_version": skill.active_version,
+            "actual_diff": _actual_diff(self.store.get_active_version(skill_id), sv),
+            "evaluations": reports,
+            "activation_history": self.store.list_activation_events(skill_id),
+            "confirmation_notice": "The host must obtain actual human approval; a flag is not identity verification.",
+        }
 
-    def rollback_to(self, skill_id: str, version: int) -> Skill:
+    @staticmethod
+    def _report_issue(skill: Skill, sv: SkillVersion, report: Any) -> str | None:
+        baseline = skill.active_version if skill.active_version is not None else sv.version
+        if sv.status != "candidate":
+            return (
+                "Only a candidate can be approved; use rollback for previously approved versions."
+            )
+        bases = sv.derived_from.get("activation_base", [])
+        if bases and bases != [str(skill.active_version)]:
+            return (
+                "Candidate was based on another active version. Rebase its learning before review."
+            )
+        if report.skill_id != skill.id or (report.version_a, report.version_b) != (
+            baseline,
+            sv.version,
+        ):
+            return "Evaluation must compare the current active version with this candidate (or v1 with itself)."
+        if not report.results or any(
+            type(r.get("supported_a")) is not bool or type(r.get("supported_b")) is not bool
+            for r in report.results
+        ):
+            return "Evaluation lacks valid per-case boolean verdicts. Run a fresh evaluation."
+        if any(not r["supported_b"] for r in report.results):
+            return "Candidate must pass every reviewed regression case before activation."
+        if report.score_b != 1.0 or report.score_a != sum(
+            r["supported_a"] for r in report.results
+        ) / len(report.results):
+            return (
+                "Evaluation scores are inconsistent with per-case results. Run a fresh evaluation."
+            )
+        return None
+
+    def approve_version(
+        self,
+        skill_id: str,
+        version: int,
+        *,
+        evaluation_id: str = "",
+        confirmed: bool = False,
+        reviewer: str = "",
+        reason: str = "",
+    ) -> Skill:
+        """Activate only an explicitly human-reviewed candidate with passing stored evidence."""
+        skill = self.store.get_skill(skill_id)
+        sv = self.store.get_skill_version(skill_id, version)
+        self._confirmation(confirmed, reviewer, reason)
+        if not evaluation_id:
+            raise ApprovalRequiredError(
+                "Provide a saved evaluation_id after reviewing its per-case results."
+            )
+        report = self.store.get_eval_report(evaluation_id)
+        issue = self._report_issue(skill, sv, report)
+        if issue:
+            raise ApprovalRequiredError(issue)
+        ensure_no_secrets(json.dumps(sv.to_dict(), ensure_ascii=False), where="candidate")
+        return self.store.activate_version(
+            skill_id,
+            version,
+            expected_active=skill.active_version,
+            expected_status="candidate",
+            event="approve",
+            evaluation_id=evaluation_id,
+            reviewer=reviewer.strip(),
+            reason=reason.strip(),
+        )
+
+    @staticmethod
+    def _confirmation(confirmed: bool, reviewer: str, reason: str) -> None:
+        if (
+            confirmed is not True
+            or not isinstance(reviewer, str)
+            or not reviewer.strip()
+            or not isinstance(reason, str)
+            or not reason.strip()
+        ):
+            raise ApprovalRequiredError(
+                "Review the candidate and evaluation with the user, then supply confirmed=true, "
+                "reviewer and reason. A model must not grant its own approval."
+            )
+        ensure_no_secrets(reviewer + "\n" + reason, where="review metadata")
+
+    def rollback_to(
+        self,
+        skill_id: str,
+        version: int,
+        *,
+        confirmed: bool = False,
+        reviewer: str = "",
+        reason: str = "",
+    ) -> Skill:
         """Move the active pointer back to a previously approved version.
 
         The abandoned active version is marked ``rolled_back`` (auditable);
@@ -262,8 +424,9 @@ class CorrectionEngine:
         """
         skill = self.store.get_skill(skill_id)
         target = self.store.get_skill_version(skill_id, version)
+        self._confirmation(confirmed, reviewer, reason)
 
-        if target.status != "approved":
+        if target.status not in ("approved", "rolled_back"):
             raise VersionStateError(
                 f"Cannot roll back to v{version}: its status is "
                 f"'{target.status}'. Only previously human-approved versions "
@@ -274,18 +437,40 @@ class CorrectionEngine:
         if current == version:
             return skill  # already active — nothing to do
 
-        if current is not None:
-            current_sv = self.store.get_skill_version(skill_id, current)
-            if current_sv.status == "approved":
-                self.store.set_version_status(skill_id, current, "rolled_back")
-
-        self.store.set_active_version(skill_id, version)
-        return self.store.get_skill(skill_id)
+        return self.store.activate_version(
+            skill_id,
+            version,
+            expected_active=current,
+            expected_status=target.status,
+            event="rollback",
+            evaluation_id=None,
+            reviewer=reviewer.strip(),
+            reason=reason.strip(),
+        )
 
 
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
+
+
+def _actual_diff(before: SkillVersion | None, after: SkillVersion) -> list[dict[str, Any]]:
+    previous = before.to_dict() if before else {}
+    current = after.to_dict()
+    fields = (
+        "summary",
+        "trigger_conditions",
+        "decision_rules",
+        "exception_handling",
+        "anti_patterns",
+        "open_questions",
+        "derived_from",
+    )
+    return [
+        {"field": key, "before": previous.get(key), "after": current[key]}
+        for key in fields
+        if previous.get(key) != current[key]
+    ]
 
 
 def _format_apply_prompt(base_sv: SkillVersion, corrections: list[Correction]) -> str:

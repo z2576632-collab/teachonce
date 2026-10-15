@@ -9,6 +9,7 @@ evidence grounding, and persistence discipline.
 from __future__ import annotations
 
 import json
+import math
 from typing import Any
 
 from .errors import LLMNotConfiguredError, SchemaValidationError
@@ -85,20 +86,31 @@ class LearningEngine:
         ``payload`` keys: ``task_goal`` (required), ``steps``, ``context``,
         ``key_judgments``, ``outcome``, ``tags``.
         """
-        task_goal = str(payload.get("task_goal", "")).strip()
+        if not isinstance(payload, dict):
+            raise SchemaValidationError("Demonstration must be a JSON object.")
+        ensure_no_secrets(json.dumps(payload, ensure_ascii=False), where="demonstration")
+        task_goal = _text(payload.get("task_goal", ""), "task_goal")
         if not task_goal:
             raise SchemaValidationError(
                 "Demonstration requires a non-empty 'task_goal' — state what "
                 "the user was trying to accomplish."
             )
 
+        steps = payload.get("steps", [])
+        if not isinstance(steps, list) or any(not isinstance(step, dict) for step in steps):
+            raise SchemaValidationError("Demonstration steps must be a list of objects.")
+        for step in steps:
+            if not _text(step.get("action", ""), "action"):
+                raise SchemaValidationError("Each demonstration step needs a non-empty action.")
+            for field in ("target", "decision", "rationale"):
+                _text(step.get(field, ""), field)
         demo = Demonstration.create(
             task_goal=task_goal,
-            steps=payload.get("steps"),
-            context=str(payload.get("context", "")),
+            steps=steps,
+            context=_text(payload.get("context", ""), "context"),
             key_judgments=_as_judgments(payload.get("key_judgments")),
-            outcome=str(payload.get("outcome", "")),
-            tags=[str(t) for t in payload.get("tags", [])],
+            outcome=_text(payload.get("outcome", ""), "outcome"),
+            tags=_clean_str_list(payload.get("tags", [])),
         )
 
         # Safety red line: never store credentials (AGENTS.md §5.1).
@@ -117,24 +129,48 @@ class LearningEngine:
     # step 2: extract a candidate skill from demonstrations
     # ------------------------------------------------------------------
 
+    def learning_context(self, name: str, demonstration_ids: list[str]) -> dict[str, Any]:
+        """Return real evidence and extraction instructions for an external host model."""
+        if not isinstance(name, str) or not name.strip() or not demonstration_ids:
+            raise SchemaValidationError("Provide a skill name and demonstration ids.")
+        if len(set(demonstration_ids)) != len(demonstration_ids):
+            raise SchemaValidationError("Demonstration ids must be distinct.")
+        demos = [self.store.get_demonstration(did) for did in demonstration_ids]
+        prompt = _format_demonstrations(name, demos)
+        ensure_no_secrets(prompt, where="learning context")
+        return {
+            "system_prompt": _LEARN_SYSTEM_PROMPT,
+            "user_prompt": prompt,
+            "demonstration_ids": demonstration_ids,
+            "server_inference_performed": False,
+        }
+
     def extract_candidate_skill(
         self,
         name: str,
         demonstration_ids: list[str],
         *,
         description: str = "",
+        proposal: dict[str, Any] | None = None,
     ) -> tuple[Skill, SkillVersion]:
         """Synthesize a v1 candidate skill from one or more demonstrations."""
         if not name.strip():
             raise SchemaValidationError("Skill name must not be empty.")
         if not demonstration_ids:
             raise SchemaValidationError("Provide at least one demonstration id to learn from.")
+        if len(set(demonstration_ids)) != len(demonstration_ids):
+            raise SchemaValidationError("Demonstration ids must be distinct.")
+        ensure_no_secrets(name + "\n" + description, where="skill metadata")
 
         demos = [self.store.get_demonstration(did) for did in demonstration_ids]
         user_prompt = _format_demonstrations(name, demos)
 
-        llm = self._require_llm()
-        raw = llm.complete(_LEARN_SYSTEM_PROMPT, user_prompt, json_mode=True)
+        if proposal is None:
+            llm = self._require_llm()
+            raw = llm.complete(_LEARN_SYSTEM_PROMPT, user_prompt, json_mode=True)
+        else:
+            # Explicit caller input, never an automatic fallback or fake model call.
+            raw = json.dumps(proposal, ensure_ascii=False)
         data = parse_json_response(raw)
         cleaned = validate_skill_payload(data, valid_ids={d.id for d in demos})
 
@@ -142,8 +178,6 @@ class LearningEngine:
             name=name.strip(),
             description=description.strip() or cleaned["summary"],
         )
-        self.store.create_skill(skill)
-
         sv = SkillVersion(
             skill_id=skill.id,
             version=1,
@@ -155,9 +189,12 @@ class LearningEngine:
             summary=cleaned["summary"],
             changelog=(f"Initial version: extracted from {len(demos)} demonstration(s)."),
             status="candidate",
-            derived_from={"demonstrations": [d.id for d in demos]},
+            derived_from={
+                "demonstrations": [d.id for d in demos],
+                **({"inference_sources": ["host-proposal"]} if proposal is not None else {}),
+            },
         )
-        self.store.add_skill_version(sv)
+        self.store.create_skill_with_version(skill, sv)
         return skill, sv
 
 
@@ -215,7 +252,7 @@ def _as_judgments(raw: Any) -> list[dict[str, str]]:
             raise SchemaValidationError(
                 "Each key judgment must be an object with situation/decision/why."
             )
-        out.append({str(k): str(v) for k, v in item.items()})
+        out.append({str(k): _text(v, "key judgment") for k, v in item.items()})
     return out
 
 
@@ -230,7 +267,10 @@ def validate_skill_payload(data: dict[str, Any], *, valid_ids: set[str]) -> dict
       exist (hallucinated references are dropped and recorded).
     - Malformed list items are dropped instead of silently mis-stored.
     """
-    summary = str(data.get("summary", "")).strip()
+    if not isinstance(data, dict):
+        raise SchemaValidationError("Skill payload must be a JSON object.")
+    ensure_no_secrets(json.dumps(data, ensure_ascii=False), where="skill payload")
+    summary = _text(data.get("summary", ""), "summary")
 
     trigger_conditions = _clean_str_list(data.get("trigger_conditions"))
     if not trigger_conditions:
@@ -242,11 +282,14 @@ def validate_skill_payload(data: dict[str, Any], *, valid_ids: set[str]) -> dict
     rules: list[DecisionRule] = []
     rule_ids: set[str] = set()
     dropped_sources: list[str] = []
-    for item in data.get("decision_rules", []) or []:
+    raw_rules = data.get("decision_rules", [])
+    if not isinstance(raw_rules, list):
+        raise SchemaValidationError("decision_rules must be a list of objects.")
+    for item in raw_rules:
         if not isinstance(item, dict):
             continue
-        condition = str(item.get("condition", "")).strip()
-        decision = str(item.get("decision", "")).strip()
+        condition = _text(item.get("condition", ""), "condition")
+        decision = _text(item.get("decision", ""), "decision")
         if not condition or not decision:
             continue
         rule_id = item.get("id")
@@ -259,19 +302,23 @@ def validate_skill_payload(data: dict[str, Any], *, valid_ids: set[str]) -> dict
                     f"Duplicate decision rule id '{rule_id}'. Use a unique id for each rule."
                 )
             rule_ids.add(rule_id)
-        sources_raw = [str(s) for s in item.get("sources", []) or []]
+        sources_raw = _clean_str_list(item.get("sources", []))
         sources = [s for s in sources_raw if s in valid_ids]
         dropped_sources.extend(s for s in sources_raw if s not in valid_ids)
-        try:
-            confidence = float(item.get("confidence", 0.5))
-        except (TypeError, ValueError):
-            confidence = 0.5
+        confidence = item.get("confidence", 0.5)
+        if (
+            isinstance(confidence, bool)
+            or not isinstance(confidence, (int, float))
+            or not math.isfinite(confidence)
+            or not 0 <= confidence <= 1
+        ):
+            raise SchemaValidationError("Rule confidence must be a finite JSON number from 0 to 1.")
         rules.append(
             DecisionRule.create(
                 rule_id=rule_id,
                 condition=condition,
                 decision=decision,
-                rationale=str(item.get("rationale", "")).strip(),
+                rationale=_text(item.get("rationale", ""), "rationale"),
                 confidence=confidence,
                 sources=sources,
             )
@@ -283,11 +330,14 @@ def validate_skill_payload(data: dict[str, Any], *, valid_ids: set[str]) -> dict
         )
 
     exception_handling: list[dict[str, str]] = []
-    for item in data.get("exception_handling", []) or []:
+    raw_exceptions = data.get("exception_handling", [])
+    if not isinstance(raw_exceptions, list):
+        raise SchemaValidationError("exception_handling must be a list of objects.")
+    for item in raw_exceptions:
         if not isinstance(item, dict):
             continue
-        situation = str(item.get("situation", "")).strip()
-        handling = str(item.get("handling", "")).strip()
+        situation = _text(item.get("situation", ""), "situation")
+        handling = _text(item.get("handling", ""), "handling")
         if situation and handling:
             exception_handling.append({"situation": situation, "handling": handling})
 
@@ -309,6 +359,14 @@ def validate_skill_payload(data: dict[str, Any], *, valid_ids: set[str]) -> dict
 
 
 def _clean_str_list(raw: Any) -> list[str]:
-    if not raw or not isinstance(raw, list):
+    if raw is None:
         return []
-    return [str(x).strip() for x in raw if str(x).strip()]
+    if not isinstance(raw, list) or any(not isinstance(x, str) for x in raw):
+        raise SchemaValidationError("Expected a list of strings, not coerced values.")
+    return [x.strip() for x in raw if x.strip()]
+
+
+def _text(raw: Any, field: str) -> str:
+    if not isinstance(raw, str):
+        raise SchemaValidationError(f"'{field}' must be text, not a coerced value.")
+    return raw.strip()

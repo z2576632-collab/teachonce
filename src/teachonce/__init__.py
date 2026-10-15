@@ -4,4 +4,4 @@ A personal work-experience learning engine, exposed as an Agent Skill
 and an MCP server. See docs/PRODUCT.md for the product definition.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.4.0"

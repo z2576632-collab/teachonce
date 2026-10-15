@@ -179,7 +179,7 @@ def test_apply_with_explicit_correction_ids(store):
 # ---------------------------------------------------------------------------
 
 
-def test_approve_and_rollback_flow(store):
+def test_approve_and_rollback_flow(store, reviewed_approval):
     skill_id, _ = _setup_v1(store)
     engine = CorrectionEngine(store, ScriptedLLM([_record_payload()]))
     correction = engine.record_correction(skill_id, "录音规则")
@@ -187,12 +187,14 @@ def test_approve_and_rollback_flow(store):
     engine2.apply_correction(skill_id)
 
     # approve v2
-    skill = engine2.approve_version(skill_id, 2)
+    skill = reviewed_approval(engine2, skill_id, 2)
     assert skill.active_version == 2
     assert store.get_skill_version(skill_id, 2).status == "approved"
 
     # rollback to v1
-    skill = engine2.rollback_to(skill_id, 1)
+    skill = engine2.rollback_to(
+        skill_id, 1, confirmed=True, reviewer="test human", reason="Review rollback"
+    )
     assert skill.active_version == 1
     assert store.get_skill_version(skill_id, 2).status == "rolled_back"
     assert store.get_skill_version(skill_id, 1).status == "approved"
@@ -206,13 +208,17 @@ def test_rollback_to_candidate_rejected(store):
     engine2.apply_correction(skill_id)  # v2 is a candidate
 
     with pytest.raises(VersionStateError):
-        engine2.rollback_to(skill_id, 2)
+        engine2.rollback_to(
+            skill_id, 2, confirmed=True, reviewer="test human", reason="Review rollback"
+        )
 
 
 def test_rollback_to_active_is_noop(store):
     skill_id, _ = _setup_v1(store)
     engine = CorrectionEngine(store)
-    skill = engine.rollback_to(skill_id, 1)  # v1 already active + approved
+    skill = engine.rollback_to(
+        skill_id, 1, confirmed=True, reviewer="test human", reason="Already active"
+    )
     assert skill.active_version == 1
 
 
@@ -223,13 +229,13 @@ def test_approve_requires_existing_version(store):
         engine.approve_version(skill_id, 99)
 
 
-def test_second_revision_preserves_prior_evidence_and_rule_ids(store):
+def test_second_revision_preserves_prior_evidence_and_rule_ids(store, reviewed_approval):
     skill_id, _ = _setup_v1(store)
     engine = CorrectionEngine(store, ScriptedLLM([_record_payload()]))
     c1 = engine.record_correction(skill_id, "录音单独存放")
     engine.llm = ScriptedLLM([_revision_payload(c1.id)])
     v2 = engine.apply_correction(skill_id)
-    engine.approve_version(skill_id, v2.version)
+    reviewed_approval(engine, skill_id, v2.version)
     before = [v.to_dict() for v in store.list_skill_versions(skill_id)]
 
     engine.llm = ScriptedLLM([_record_payload()])

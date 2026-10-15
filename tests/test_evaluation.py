@@ -110,7 +110,7 @@ def test_llm_judge_evaluation(store):
     assert "Judge bias is possible" in report.notes
 
 
-def test_auto_method_prefers_llm_judge_when_llm_present(store):
+def test_auto_method_prefers_blind_decisions_when_llm_present(store):
     skill_id = _setup_two_versions(store)
     responses = [
         json.dumps({"predicted_decision": "x", "matches_expected": True, "reasoning": "r"}),
@@ -118,9 +118,9 @@ def test_auto_method_prefers_llm_judge_when_llm_present(store):
         json.dumps({"predicted_decision": "x", "matches_expected": True, "reasoning": "r"}),
         json.dumps({"predicted_decision": "x", "matches_expected": True, "reasoning": "r"}),
     ]
-    evaluator = SkillEvaluator(store, ScriptedLLM(responses))
+    evaluator = SkillEvaluator(store, ScriptedLLM(responses * 2))
     report = evaluator.evaluate(skill_id, 1, 2, CASES, method="auto")
-    assert report.method == "llm_judge"
+    assert report.method == "llm_blind"
 
 
 def test_auto_method_falls_back_to_heuristic(store):

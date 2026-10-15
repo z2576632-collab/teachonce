@@ -3,221 +3,122 @@
 > **Teach your AI once. Let it learn how you work.**
 > 教你的 AI 一次，让它学会你的工作方式。
 
-TeachOnce 是一个从人类**实际操作、任务示范和纠错反馈**中持续学习的「AI 工作经验引擎」。
+TeachOnce 是学习个人工作经验的 **Agent Skill + MCP Server**。它从任务示范和纠错中
+提取适用条件、判断原则和异常处理方式，供已有 Agent 在新任务中复用。
 
-它不是工作流录制器。普通录制只能知道用户**做了什么**；TeachOnce 的目标是学会用户**为什么这样做**——在什么情况下采用哪种方法、如何判断例外、如何处理没见过的情况——并把这些经验变成可复用、可迁移、可纠正、可回滚的 **Agent Skill**，通过 **MCP** 提供给任何兼容的 Agent。
+当前版本 **0.4.0，受控试用阶段**。学习、匹配、反馈、评估、人工审阅、审批、回滚和
+Skill 导出都有实际实现。TeachOnce 输出建议，真实任务执行由宿主 Agent 在用户权限内完成。
+尚未证明开放领域任务的成功率；测试通过不等同于模型效果。
 
-## 为什么需要它
+## 在 Codex 中使用
 
-| 现有做法 | 问题 | TeachOnce 的做法 |
-|---|---|---|
-| 屏幕录制 / RPA | 机械回放固定操作序列，任务一变就失效 | 从多个示范中提取**决策规则**（条件 → 做法 → 理由），适应任务变化 |
-| 手工写 prompt / 规则 | 写的人说不全部自己的隐性经验 | 从真实操作和**自然语言纠错**中反向提取经验 |
-| 一次性教学 | 错了只能重教 | 纠错转化为**新版本 Skill**，保留历史、可审批、可回滚 |
-| 绑定某个 Agent | 换个工具就要重教 | 导出为标准 **Agent Skills**，经 **MCP** 跨 Agent 复用 |
+需要 Python 3.12+。在仓库目录运行：
 
-## 核心能力（MVP 范围）
-
-1. **示范导入** — 记录一次任务的结构化示范：目标、操作步骤、关键判断、结果。
-2. **Skill 提取** — 从多次示范中提取可迁移的：适用条件 / 决策规则 / 异常处理 / 反面模式。
-3. **任务匹配** — 新任务到来时判断是否适用某个 Skill，并**说明匹配理由**；把握不足时要求人工确认而不是硬套。
-4. **纠错更新** — 用户用自然语言指出错误后，生成改进版 Skill（含结构化变更说明），保留全部历史版本。
-5. **版本评估** — 用**未见过的案例**对比新旧版本是否更可靠，评估结果落库、可查。
-6. **MCP 接口** — 学习、匹配、执行准备、更新能力全部通过 MCP 工具暴露。
-7. **标准化导出** — 将 Skill 导出为 Agent Skills 标准的 `SKILL.md`，可被其他兼容 Agent 直接使用。
-
-## 快速开始
-
-### 1. 安装
-
-```bash
-git clone https://github.com/z2576632-collab/teachonce.git
-cd teachonce
+```powershell
 python -m venv .venv
-# Windows: .venv\Scripts\activate
-# macOS/Linux: source .venv/bin/activate
-pip install -e ".[dev]"
+.venv\Scripts\python -m pip install -e ".[dev]"
+.venv\Scripts\teachonce doctor
+.venv\Scripts\teachonce probe
+.venv\Scripts\teachonce install-skill --dest .agents/skills
+.venv\Scripts\teachonce codex-config
 ```
 
-### 2. 配置 LLM（学习引擎需要）
+把最后一个命令生成的内容添加到 Codex MCP 配置，再在 Codex 中使用 `$teachonce`。
+配置只包含 Python 路径和环境变量名，不写入 API Key；审批和回滚工具要求宿主弹出授权。
+完整步骤见 [Codex 接入](docs/CODEX.md)。
 
-TeachOnce 的学习引擎需要调用一个 **OpenAI 兼容**的 LLM API（支持 DeepSeek / OpenAI / 本地 Ollama 等）：
+**无需额外 API Key 的宿主模式**：Codex 读取学习上下文，用自身模型生成明确的
+`proposal`，TeachOnce 校验来源、数据结构并保存为候选。服务不会冒充自己调用了模型。
+可使用同一路径提交匹配、纠错分类和修订提案。
 
-```bash
-# 以 DeepSeek 为例
-export TEACHCONE_LLM_API_KEY="sk-..."                       # Windows 用 set / $env:
-export TEACHCONE_LLM_BASE_URL="https://api.deepseek.com/v1" # 可选，默认 OpenAI
-export TEACHCONE_LLM_MODEL="deepseek-chat"                  # 可选，默认 gpt-4o-mini
+**可选 API 模式**：配置 OpenAI 兼容 Provider 后，TeachOnce 自行调用模型学习、
+匹配、盲测或 GEPA 优化。新环境变量使用 `TEACHONCE_*`；旧拼写 `TEACHCONE_*`
+继续兼容。远程端点要求 HTTPS；本地端点允许 HTTP。
+
+```powershell
+$env:TEACHONCE_LLM_API_KEY = "<在本机设置，不提交到仓库>"
+$env:TEACHONCE_LLM_BASE_URL = "https://api.deepseek.com/v1"
+$env:TEACHONCE_LLM_MODEL = "deepseek-chat"
 ```
 
-未配置 API Key 时，学习类操作会**明确报错**并提示配置——不会伪装成功。
+Codex 账户登录不等于给独立 Python 服务提供 API 凭据。诊断命令不会请求模型或验证 Key 的有效性。
 
-### 3. 跑端到端 Demo（「个人课程资料整理」场景）
+## 学习闭环
 
-```bash
-python -m demo.run_demo
+1. 导入真实且已脱敏的示范，保留目标、操作、关键判断、理由和结果。
+2. 综合示范生成 candidate，检查证据和未覆盖问题。
+3. 准备独立案例。推荐 `llm_blind`：先看规则与情境作决策，再由单独调用比较期望答案。
+4. 用 `teachonce_review_version` 查看实际差异与逐例评估；取得用户对该版本的明确批准后启用。
+5. 匹配新任务并解释计划；风险说明、缺失信息、低置信或空计划要求确认。
+6. 宿主执行后用 `teachonce_record_outcome` 保存实际报告。显式反馈成为 open correction，
+   不自动改写规则、不自动批准版本。
+7. 修订、再次独立评估、人工批准；出现问题可恢复以前批准的版本。
+
+审批绑定已保存的评估 ID，候选必须通过全部审阅案例；比较基准必须为当前 active 版本。
+状态、active 指针和审计事件在同一 SQLite 事务中保存。确认字段是宿主授权记录，
+不验证用户身份；宿主必须实际取得人类许可。旧版本不会被覆盖。
+
+## 命令行与 Demo
+
+```powershell
+teachonce --db local.db import examples/course-demonstration.json
+teachonce --db local.db list
+teachonce --db local.db review <skill-id> <version>
+teachonce --db local.db approve <skill-id> <version> --evaluation <report-id> --reviewer "<姓名>" --reason "<审阅理由>" --yes
+teachonce --db local.db rollback <skill-id> <version> --reviewer "<姓名>" --reason "<恢复理由>" --yes
+teachonce --db local.db export <skill-id> --output learned-skills
+teachonce demo
 ```
 
-Demo 剧本：人类示范 3 次整理课程资料 → AI 提取 Skill → 遇到新任务自主判断 → 用户纠错 → 生成 v2 → 用未见过的案例验证 v2 是否比 v1 更可靠。
+`teachonce demo` 已包含在安装包中，使用真实配置的 API Provider。没有配置时明确报错。
+它先评估再交互审阅；不通过、非交互环境或用户拒绝时保留候选，不宣称全部完成。
+兼容入口 `python -m demo.run_demo` 仍可在仓库中使用。
+示范是合成输入，规则由运行时模型生成，不预置成功结果。
 
-### 4. 作为 MCP Server 接入任意 Agent
+## MCP 工具（22 个）
 
-```bash
-teachonce-mcp   # 或 python -m teachonce.mcp_server
-```
-
-在支持 MCP 的 Agent（WorkBuddy / Claude Code / Cursor / 其他）中配置 stdio server 即可。
-配置示例（写入 Agent 的 MCP 配置文件，如 WorkBuddy 的 `~/.workbuddy/mcp.json`、
-Claude Code 的 `~/.claude.json`，用你实际环境的 Python 绝对路径替换 `command`）：
-
-```json
-{
-  "mcpServers": {
-    "teachonce": {
-      "command": "/absolute/path/to/python",
-      "args": ["-m", "teachonce.mcp_server"],
-      "env": {
-        "TEACHCONE_LLM_API_KEY": "sk-...",
-        "TEACHCONE_LLM_BASE_URL": "https://api.deepseek.com/v1",
-        "TEACHCONE_LLM_MODEL": "deepseek-chat"
-      }
-    }
-  }
-}
-```
-
-前提是该 Python 环境已 `pip install -e` 本仓库。不配 `env` 也能启动：
-历史查询类工具不需要 LLM，学习类工具会在调用时明确提示缺 Key。
-
-暴露的工具：
-
-| MCP 工具 | 作用 |
+| 用途 | 工具 |
 |---|---|
-| `teachonce_import_demonstration` | 导入一次任务示范 |
-| `teachonce_list_demonstrations` | 找回已保存的示范和 ID，继续生成 Skill |
-| `teachonce_generate_skill` | 从示范生成候选 Skill |
-| `teachonce_match_skill` | 为新任务匹配 Skill 并说明理由 |
-| `teachonce_get_skill` / `teachonce_list_skills` | 查看 Skill 与其全部版本 |
-| `teachonce_record_correction` | 记录自然语言纠错 |
-| `teachonce_list_corrections` | 查看待处理纠错或全部纠错历史 |
-| `teachonce_apply_correction` | 生成改进版 Skill（保留历史） |
-| `teachonce_approve_version` / `teachonce_rollback` | 审批新版本 / 回滚到历史版本 |
-| `teachonce_evaluate_versions` | 用未见案例对比两个版本 |
-| `teachonce_list_evaluations` | 读取历史评估的逐例结论与方法局限 |
-| `teachonce_export_skill_md` | 导出 Agent Skills 标准 SKILL.md |
-| `teachonce_optimize_skill` | 用 GEPA 反思进化优化规则（可选，见下） |
-| `teachonce_import_gui_recording` | 导入 OpenAdapt GUI 录制导出（需显式授权，见下） |
+| 示范与学习 | `teachonce_import_demonstration`、`teachonce_list_demonstrations`、`teachonce_learning_context`、`teachonce_generate_skill` |
+| 任务迁移 | `teachonce_matching_context`、`teachonce_match_skill` |
+| 纠错 | `teachonce_record_correction`、`teachonce_list_corrections`、`teachonce_revision_context`、`teachonce_apply_correction` |
+| 历史与审阅 | `teachonce_list_skills`、`teachonce_get_skill`、`teachonce_review_version` |
+| 评估 | `teachonce_evaluate_versions`、`teachonce_list_evaluations` |
+| 审批/恢复 | `teachonce_approve_version`、`teachonce_rollback` |
+| 执行反馈 | `teachonce_record_outcome`、`teachonce_list_outcomes` |
+| 可移植输出 | `teachonce_export_skill_md` |
+| 可选适配器 | `teachonce_optimize_skill`、`teachonce_import_gui_recording` |
 
-### 5. 可选：开源适配器
+## 评估与可选集成
 
-**GEPA 规则自进化**（[gepa-ai/gepa](https://github.com/gepa-ai/gepa)，MIT，UC Berkeley）：
+- `llm_blind` 是配置 Provider 时的默认评估模式，决策阶段不接收期望答案；
+  仍存在模型和裁判偏差，不能当作真实工具执行成功率。
+- `llm_judge` 保留兼容，裁判可看到期望答案，只衡量规则支持性。
+- `heuristic` 仅做关键词重叠检查；无 Provider 的 `auto` 使用它并明确标注方法。
+  宿主模式也可以用它检查管道，但独立语义验收仍需人类或配置的评估 Provider。
+- GEPA：`pip install "teachonce[gepa]"`。调优案例参与学习，`best_score` 标为 tuning。
+  独立评估拒绝重复案例或已记录的调优情境；多轮优化、纠错与重启保留指纹。
+  同义改写、示范/纠错语义重叠和旧记录缺失仍需人工识别。
+- GUI 事件：只导入用户已授权、显式转换的事件 JSON，默认关闭；OpenAdapt 原生 SQLite/视频目录尚不支持；
+  `TEACHONCE_GUI_OBSERVATION=1` 明确开启导入，不启动录制。实时屏幕观察未实现。
+- Hermes/DSPy 的既有评估结论与复用边界见 [产品文档](docs/PRODUCT.md)，并未宣称新增集成。
 
-```bash
-pip install "teachonce[gepa]"   # 装在同一 Python 环境
+## 隐私与维护
+
+个人记录默认存入 `~/.teachonce/teachonce.db`，可用 `TEACHONCE_HOME` 指定目录。
+无遥测。上下文会返回给宿主；启用 API Provider 时推理内容会发往所配置端点，
+本地保存不意味着完全本地计算。敏感信息扫描是补充防线，请先脱敏示范和反馈。
+
+```powershell
+python -m pytest
+ruff check .
+ruff format --check .
 ```
 
-之后 `teachonce_optimize_skill` 会用 GEPA 的反思进化（reflective evolution）在调优案例上
-自动优化决策规则。优化用的判分是 TeachOnce 自带的 LLM judge，反思模型复用你配置的
-OpenAI 兼容 API。**产物永远是 candidate**——必须人工审批 + 回归评估后才成为 active 版本，
-预算（`max_metric_calls`）显式受控。
+CI 验证 Linux/Windows、Python 3.12/3.13、真实 stdio 子进程及独立 wheel 安装。
+测试使用 ScriptedLLM 或明确的测试提案，不请求真实模型 API。
 
-传给优化器的 `cases` 会参与学习，返回的 `best_score` 是调优分数。
-请另留一组独立案例用于 `teachonce_evaluate_versions`。新优化版本保存调优案例的
-`situation` 指纹，多轮优化和后续纠错会继承它们；服务重启后依然会拒绝将这些案例
-当作未见案例评估。指纹忽略大小写、空白和 Unicode 全半角差异，不依赖期望答案或案例 ID。
-评估和优化也会拒绝批次中的重复情境，并在模型调用前扫描敏感内容。
-这种检查不能识别同义改写、示范/纠错的语义重叠，也不能补回旧优化版本缺失的指纹，
-独立准备评估集仍是调用者的责任。
+[产品约定](docs/PRODUCT.md) · [架构](docs/ARCHITECTURE.md) ·
+[试用验收与边界](docs/READINESS.md) · [开发规范](AGENTS.md)
 
-**OpenAdapt 录制导入**（[OpenAdaptAI](https://github.com/OpenAdaptAI)，MIT）：
-
-用 `openadapt-capture` 录制一次桌面操作后，把 JSON 导出转成 TeachOnce 示范。
-**默认关闭**：需先设置 `TEACHCONE_GUI_OBSERVATION=1` 显式授权，且导入前请自查导出内容
-（会经敏感信息扫描，但屏幕上放过什么只有你知道）。适配器只读导出文件，不会启动录制。
-
-### 6. 换一个聊天后继续学习
-
-只要 MCP Server 仍使用同一个数据库（默认 `~/.teachonce/teachonce.db`），
-新聊天或服务重启后都可以从保存的记录继续：
-
-1. 调用 `teachonce_list_demonstrations` 找回示范 ID，再用 `teachonce_generate_skill` 提取经验。
-2. 调用 `teachonce_list_skills` 找到 Skill，用 `teachonce_list_corrections(skill_id, status="open")` 查看待处理反馈。
-3. 调用 `teachonce_apply_correction` 生成候选版；已有规则 ID 与前几轮纠错来源会保留。
-4. 用未见案例评估候选版；之后可随时用 `teachonce_list_evaluations(skill_id)` 重新读取报告。
-5. 人工审查规则、变更说明和逐例评估结果后，调用 `teachonce_approve_version`。
-
-这三个查询工具不需要 API Key，也不会重新请求模型。读取记录会将内容返回给调用它的宿主 Agent。
-纠错只能用于所属 Skill，已应用的纠错不能重复消费；若需继续调整，请记录新反馈。
-并发请求或写入失败不会留下“新版本已生成、纠错却没标记”的半完成状态。
-
-评估仅接受真正的 JSON 布尔值 `true` / `false`；字符串 `"false"` 等无效输出会报错，
-不会生成评估分数。GEPA 裁判遵循相同校验，预测和理由都必须是非空字符串。
-报告始终保留评估方法和案例隔离检查的局限，自定义备注不能覆盖它们。
-
-## 项目结构
-
-```
-teachonce/
-├── AGENTS.md              # AI 开发规范（每次开发前必读）
-├── docs/
-│   ├── PRODUCT.md         # 产品定位与方向（每次开发前必读）
-│   └── ARCHITECTURE.md    # 架构设计与技术决策
-├── src/teachonce/
-│   ├── models.py          # 数据模型
-│   ├── store.py           # SQLite 存储层（本地优先）
-│   ├── llm.py             # LLM Provider 抽象（真实 API + 测试替身）
-│   ├── learning.py        # 学习引擎：示范 → Skill
-│   ├── matching.py        # 匹配引擎：任务 ↔ Skill
-│   ├── correction.py      # 纠错引擎：反馈 → 新版本
-│   ├── evaluation.py      # 评估引擎：未见案例对比
-│   ├── skill_export.py    # Agent Skills 标准导出
-│   └── mcp_server.py      # MCP Server
-├── demo/                  # 「课程资料整理」端到端 Demo
-└── tests/                 # pytest 测试套件
-```
-
-## 当前状态
-
-**已实现（v0.3.0）**
-- ✅ 结构化示范导入（JSON schema 校验 + 敏感信息红灯检查）
-- ✅ 多示范 → Skill 提取（LLM + JSON schema 校验 + 证据标注）
-- ✅ 任务匹配（置信度 + 匹配理由 + 低置信度转人工确认）
-- ✅ 自然语言纠错 → 版本化更新（changelog / 审批 / 回滚）
-- ✅ 未见案例版本评估（LLM 裁判 + 离线启发式两种模式，均如实标注方法论）
-- ✅ MCP Server（16 个工具）+ Agent Skills `SKILL.md` 导出
-- ✅ 多轮纠错保留规则标识和累计证据，版本与纠错状态原子保存
-- ✅ **GEPA 反思进化适配器**：调优案例驱动的规则自动优化，保存案例指纹以隔离后续评估（可选 `[gepa]` extra；历史手工验证记录见 docs/PRODUCT.md §4.3）
-- ✅ **OpenAdapt 录制导入适配器**：GUI 操作记录转示范（需 `TEACHCONE_GUI_OBSERVATION=1` 显式授权）
-- ✅ SQLite 本地存储，数据默认不出本机
-- ✅ pytest 全套测试 + ruff + GitHub Actions CI
-
-**计划中（未实现，勿在文档中宣称可用）**
-- ⬜ GUI 实时屏幕观察（不经导出文件的直接捕获；当前仅支持 openadapt-capture 导出导入）
-- ⬜ 跨任务自动触发（后台 watcher，当前由宿主 Agent 显式调用 MCP 工具）
-- ⬜ DSPy / GEPA 驱动的持续自动优化循环（当前优化为单次、人工发起）
-- ⬜ 多用户 / 团队 Skill 共享
-
-**评估后决定不集成**：Hermes Agent（其自进化核心即 DSPy+GEPA，已被我们直接集成 GEPA 覆盖；
-Skill 互操作由 Agent Skills 标准满足——不耦合其仓库）。
-
-## 安全与隐私原则
-
-- 个人操作记录**默认仅本地保存**（SQLite，位于 `~/.teachonce/`），不默认上传或公开。
-- 导入示范时对疑似密码 / Token / Cookie 等内容做**红灯警告**，拒绝入库。
-- 不对真实文件系统执行任何自动操作；Skill 产出「判断 + 行动计划」，执行权始终在宿主 Agent 和用户手中。
-- Skill 更新带结构化变更说明，**人工审批**后生效，支持一键回滚。
-- 不允许通过硬编码输出伪装成功；已实现与计划中功能严格区分。
-
-## 开发
-
-```bash
-pip install -e ".[dev]"
-ruff check . && ruff format --check .
-pytest
-```
-
-**每次开发前请先阅读 [`AGENTS.md`](AGENTS.md) 与 [`docs/PRODUCT.md`](docs/PRODUCT.md)。**
-
-## License
-
-[MIT](LICENSE)
+MIT License.

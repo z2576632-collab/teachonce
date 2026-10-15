@@ -13,7 +13,7 @@ from .errors import SensitiveContentError
 # (pattern, human-readable description of what it looks like)
 _SENSITIVE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (
-        re.compile(r"(?i)\b(api[_-]?key|secret|token|password|passwd|pwd)\b\s*[:=]"),
+        re.compile(r"""(?i)\b(api[_-]?key|secret|token|password|passwd|pwd)\b["']?\s*[:=]"""),
         "key/secret/password assignment",
     ),
     (re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"), "OpenAI-style API key (sk-...)"),
@@ -21,7 +21,7 @@ _SENSITIVE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         re.compile(r"(?i)\bbearer\s+[A-Za-z0-9\-._~+/]{20,}=*"),
         "bearer token",
     ),
-    (re.compile(r"(?i)\bcookie\s*[:=]\s*\S+"), "cookie value"),
+    (re.compile(r"""(?i)\bcookie["']?\s*[:=]\s*\S+"""), "cookie value"),
     (
         re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
         "private key block",
@@ -30,6 +30,7 @@ _SENSITIVE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),
         "GitHub token (gh*_...)",
     ),
+    (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"), "GitHub fine-grained token"),
 ]
 
 

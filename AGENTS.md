@@ -30,6 +30,8 @@ TeachOnce = **Agent Skill + MCP Server**，学习个人工作经验的引擎。
 | `matching.py` | 任务 ↔ Skill 匹配 + 理由 | 不自动执行任务，只输出匹配结论与计划 |
 | `correction.py` | 纠错 → 新版本 + changelog + 审批/回滚 | 不允许覆盖历史版本 |
 | `evaluation.py` | 未见案例的版本对比 | 必须如实标注评估方法及其局限 |
+| `feedback.py` | 宿主执行报告、显式反馈关联纠错 | 不把上报当作独立验证，不自动更新/批准规则 |
+| `cli.py` | 配置诊断、接入、学习与人工审阅入口 | 不在终端输出 Key 或原始远程错误正文 |
 | `skill_export.py` | Agent Skills 标准导出 | 不发明非标准格式 |
 | `mcp_server.py` | MCP 工具面 | 工具函数只做编排，不含业务逻辑 |
 | `adapters/` | 第三方项目隔离接入（GEPA 优化、OpenAdapt 录制导入） | 可选 extra、懒加载、报错给安装命令；GUI 能力调用时检查显式授权 |
@@ -42,6 +44,8 @@ TeachOnce = **Agent Skill + MCP Server**，学习个人工作经验的引擎。
 - Python **3.12+**，全量类型注解（`from __future__ import annotations`）。
 - 格式化与 lint 一律以 `ruff check . && ruff format .` 为准（配置见 `pyproject.toml`），提交前必须通过。
 - 数据模型用 `dataclass`；对外边界（MCP 工具、导入导出）用普通 `dict`/JSON。
+- 允许明确的宿主提案：宿主模型负责推理，服务校验/持久化，标注 host-proposal。
+  不能伪称发生服务端模型调用；缺少提案和 API Provider 时仍须报错，禁止自动假结果回退。
 - 错误处理：可预期错误定义专用异常（如 `LLMNotConfiguredError`、`SchemaValidationError`、`SensitiveContentError`），错误信息必须对用户可操作（说清"怎么修"）。
 - 注释和文档字符串用中文或英文均可，但同一文件内保持一致；公开 API 必须有 docstring。
 - 不引入新依赖前先确认：标准库/已有依赖能否解决？能则不加。新依赖需在 PR 描述中说明理由。
@@ -56,15 +60,17 @@ TeachOnce = **Agent Skill + MCP Server**，学习个人工作经验的引擎。
 - 每个公开函数至少覆盖：正常路径 + 至少一个错误路径。
 - 涉及版本管理的改动，必须测：新版本不覆盖旧版本、审批、回滚。
 - 涉及 prompt 改动的 PR，必须在 `tests/` 中更新对应 ScriptedLLM 剧本并跑通全量测试。
-- CI（GitHub Actions）必须全绿；CI 只跑 `ruff` + `pytest`，不接触任何 API Key。
+- CI（GitHub Actions）必须全绿；运行 ruff、pytest、真实 stdio 和独立 wheel 安装检查，不接触真实 API Key。
 
 ## 5. 安全红线（违反即打回）
 
 1. **不记录敏感信息**：密码、Token、Cookie、私钥等一旦在示范/纠错文本中被识别，必须拦截（`SensitiveContentError`）并提示用户移除。
-2. **不自动执行危险操作**：TeachOnce 自身不对真实文件系统 / 系统做写操作。Skill 只输出判断与行动计划；执行交宿主 Agent 且需用户授权。
+2. **不自动执行危险操作**：TeachOnce 不移动/删除/覆盖待整理的用户资料。Skill 只输出判断与行动计划；执行交宿主 Agent 且需用户授权。SQLite 持久化和用户明确请求的 Skill 安装/导出在对应范围内写文件，拒绝覆盖既有 Skill 目录。
 3. **GUI 录制需显式授权**：屏幕/操作录制能力（未来阶段）默认关闭，必须用户显式开启。
 4. **数据本地优先**：个人学习记录默认仅存本地 SQLite（`~/.teachonce/`），不默认上传、不默认公开。
 5. **更新可解释、可审批、可回滚**：任何 Skill 更新必须带结构化 changelog；未审批的版本不得成为 active 版本。
+   审阅展示实际字段差异；批准绑定当前基准、逐例通过的持久评估和显式确认，状态/指针/审计原子保存。
+   确认字段不等于身份验证，宿主必须实际取得人类授权；回滚同样需要理由与明确批准。
 6. **诚实原则**：不允许虚构模型表现、任务成功率或测试数据；文档必须区分「已实现」与「计划中」；评估报告必须标注方法与局限。
 
 ## 6. Git 与提交规范
