@@ -1,7 +1,7 @@
 # ARCHITECTURE.md — TeachOnce 架构设计
 
 > 阅读顺序：`AGENTS.md` → `docs/PRODUCT.md` → 本文件。
-> 本文件描述 v0.1.0 MVP 的**实际**架构；标注「计划中」的部分尚未实现。
+> 本文件描述 v0.3.0 的**实际**架构；标注「计划中」的部分尚未实现。
 
 ## 1. 系统总览
 
@@ -35,8 +35,8 @@ TeachOnce 是一个**纯 Python 库 + MCP Server**，无独立 UI、无后台常
 │  ~/.teachonce/*.db      │         │  └ ScriptedLLM（仅测试）    │
 └─────────────────────────┘         └───────────────────────────┘
                                                 ▲
-                        计划中：adapter 层 ───────┘
-                        （OpenAdapt / Hermes，经适配器隔离，未实现）
+                        adapters/ 层 ────────────┘
+                        （GEPA 优化 / OpenAdapt 录制导入）
 ```
 
 ## 2. 学习循环（产品灵魂）
@@ -119,6 +119,8 @@ LLMProvider (ABC)
 - `apply_correction`：输入原版本 + 全部相关纠错 → LLM 输出修订版规则（每条变更带 `op`(add/modify/remove) 与理由）→ 落库为 `candidate` 新版本，changelog 结构化。
 - 显式纠错 ID 必须唯一、属于当前 Skill 且仍为 `open`；调用模型前检查，入库时再次验证状态以处理并发。
 - 修订继承基准版本的累计纠错来源；校验器保留模型提供的规则 ID，并拒绝重复 / 非法 ID，使变更说明可对应到规则。
+- 修订保留 `derived_from` 的全部来源类别，包括 `optimizations` 和 `optimization_cases`，
+  避免纠错后丢失调优记录、使已用于学习的案例重新进入未见评估集。
 - `approve_version` / `rollback_to`：人工审批后 active 指针移动；回滚仅移动指针，历史可追溯。
 
 ### 6.4 evaluation.py（未见案例回归）
@@ -127,9 +129,15 @@ LLMProvider (ABC)
   1. `llm_judge`（默认，需 API）：LLM 判断"该版本规则是否支持得出 expected_decision"；
   2. `heuristic`（离线）：规则文本与期望决策的关键词/短语重叠 —— **启发式，非语义理解**，报告中明确标注局限。
 - 输出 `EvalReport`（score_a / score_b / per-case 明细）落库；比较结论遵循"v2 不劣于 v1 且修复被纠错问题"的验收口径。
-- 所有案例先校验再请求 LLM；裁判结果要求 JSON 布尔值和非空判断 / 理由，非法输出拒绝保存报告。
+- 评估与 GEPA 复用批次校验和裁判输出校验：先校验全部案例并扫描敏感信息，
+  再请求 LLM；裁判结果要求 JSON 布尔值和非空判断 / 理由，非法输出拒绝保存报告/候选版。
 - 方法局限始终写入报告，自定义备注仅追加；当前裁判能看到期望答案，因此衡量的是规则支持性，
-  不等同于独立执行成功率。调用者负责保证案例未用于学习，系统尚不自动检测样本重叠。
+  不等同于独立执行成功率。案例身份由 `situation-v1:` + SHA-256 表示：对 situation 做
+  Unicode NFKC、casefold 与空白折叠，不包含 expected_decision 或案例 ID。评估/优化批内
+  重复情境会报错；评估另检查两个版本 `derived_from.optimization_cases` 的并集。
+  检查在模型调用前完成；逐例报告保存 `situation_fingerprint` 便于核对。
+  指纹只能发现规范化文本相同的情境，不能识别同义改写或示范/纠错的语义重叠，
+  旧版本未记录的调优案例无法补回。报告明确携带这些局限；调用者仍需独立准备评估集。
 
 ## 7. MCP 接口（`mcp_server.py`，MCPServer）
 
@@ -167,7 +175,7 @@ frontmatter 手写序列化（避免引入 PyYAML）；保证其他兼容 Agent 
 
 | 适配器 | 状态 | 设计 |
 |---|---|---|
-| `adapters/gepa_optimizer.py` | ✅ 已实现 | GEPA `optimize_anything` 进化规则文本；判分复用自有 LLM judge（`evaluation.py`）；反思模型用 `_ReflectionLM` 包装自有 `OpenAICompatibleLLM`（实现 GEPA `LanguageModel` 协议，不引入 litellm）；优化后由 LLM 重构回结构化 schema 存为 **candidate**；预算（`max_metric_calls`）显式；changelog 记录来源与预算 |
+| `adapters/gepa_optimizer.py` | ✅ 已实现 | GEPA `optimize_anything` 根据调优案例进化规则文本；判分复用自有 LLM judge（`evaluation.py`）；反思模型用 `_ReflectionLM` 包装自有 `OpenAICompatibleLLM`（实现 GEPA `LanguageModel` 协议，不引入 litellm）；优化后由 LLM 重构回结构化 schema 存为 **candidate**；预算（`max_metric_calls`）显式且必须为正整数；changelog 记录来源与预算，`derived_from` 累计保存优化来源及调优情境指纹。沿用 JSON 字段，无数据库迁移；`best_score` 仅为调优分数 |
 | `adapters/openadapt.py` | ✅ 已实现（导入部分） | openadapt-capture 的 JSON 导出 → `Demonstration`，走正常学习管道（含敏感信息扫描）；**调用时检查** `TEACHCONE_GUI_OBSERVATION=1`，否则 `ConsentRequiredError`；适配器只读导出文件，不启动录制、不挂钩输入设备；低信号事件（鼠标移动等）跳过并在 context 中计数，不静默丢弃 |
 
 实时屏幕观察（不经导出文件的直接捕获）仍未实现，属计划中，需另行显式授权设计。

@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from teachonce.errors import LLMNotConfiguredError, SchemaValidationError
+from teachonce.errors import LLMNotConfiguredError, SchemaValidationError, SensitiveContentError
 from teachonce.evaluation import SkillEvaluator
 from teachonce.llm import ScriptedLLM
 from teachonce.models import DecisionRule, Skill, SkillVersion
@@ -225,3 +225,61 @@ def test_user_notes_cannot_replace_method_limitations(store):
     assert "NOT semantic understanding" in report.notes
     assert "Release review" in saved.notes
     assert saved.notes == report.notes
+
+
+@pytest.mark.parametrize("variant", ["  FILE   A  ", "file\na", "ＦＩＬＥ　Ａ"])
+def test_duplicate_situations_rejected_even_with_changed_answers(store, variant):
+    skill_id = _setup_two_versions(store)
+    llm = ScriptedLLM([])
+    cases = [
+        {"situation": "File A", "expected_decision": "Keep", "id": "one"},
+        {"situation": variant, "expected_decision": "Archive", "id": "two"},
+    ]
+    with pytest.raises(SchemaValidationError, match="distinct situations"):
+        SkillEvaluator(store, llm).evaluate(skill_id, 1, 2, cases)
+    assert not llm.calls
+    assert store.list_eval_reports(skill_id) == []
+
+
+@pytest.mark.parametrize("field", ["situation", "expected_decision", "notes"])
+def test_sensitive_case_rejected_before_any_judge_call(store, field):
+    skill_id = _setup_two_versions(store)
+    case = {**CASES[0], field: "password=synthetic-not-a-real-credential"}
+    llm = ScriptedLLM([])
+    with pytest.raises(SensitiveContentError):
+        SkillEvaluator(store, llm).evaluate(skill_id, 1, 2, [CASES[1], case])
+    assert not llm.calls
+    assert store.list_eval_reports(skill_id) == []
+
+
+def test_sensitive_evaluation_notes_and_judge_responses_are_not_saved(store):
+    skill_id = _setup_two_versions(store)
+    llm = ScriptedLLM([])
+    with pytest.raises(SensitiveContentError):
+        SkillEvaluator(store, llm).evaluate(
+            skill_id, 1, 2, CASES, notes="password=synthetic-not-a-real-credential"
+        )
+    assert not llm.calls
+    llm.responses.append(
+        json.dumps(
+            {
+                "matches_expected": True,
+                "predicted_decision": "Keep",
+                "reasoning": "password=synthetic-not-a-real-credential",
+            }
+        )
+    )
+    with pytest.raises(SensitiveContentError):
+        SkillEvaluator(store, llm).evaluate(skill_id, 1, 2, CASES)
+    assert store.list_eval_reports(skill_id) == []
+
+
+def test_independent_reports_retain_case_isolation_limits(store):
+    skill_id = _setup_two_versions(store)
+    evaluator = SkillEvaluator(store)
+    first = evaluator.evaluate(skill_id, 1, 2, CASES, method="heuristic")
+    second = evaluator.evaluate(skill_id, 1, 2, CASES, method="heuristic")
+    assert first.id != second.id
+    assert first.results[0]["situation_fingerprint"] == second.results[0]["situation_fingerprint"]
+    assert "Case isolation" in first.notes and "paraphrases" in first.notes
+    assert "older optimization versions may lack fingerprints" in first.notes

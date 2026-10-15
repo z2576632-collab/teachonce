@@ -362,12 +362,13 @@ def build_server(
         base_version: int | None = None,
         max_metric_calls: int = 30,
     ) -> dict[str, Any]:
-        """Evolve a skill's decision rules with GEPA against held-out cases.
+        """Evolve a skill's decision rules with GEPA against tuning cases.
 
         Uses the optional GEPA adapter (pip install "teachonce[gepa]").
         The result is ALWAYS a candidate version: review it, evaluate it
         against the base, and approve it explicitly like any revision.
-        ``cases`` must be genuinely held-out (never used for learning).
+        ``cases`` become learning input. Evaluate the result on separate
+        held-out cases; recorded tuning situations cannot be reused there.
         """
         from .adapters.gepa_optimizer import optimize_skill_rules
 
@@ -384,6 +385,7 @@ def build_server(
             "base_version": outcome.base_version,
             "new_version": outcome.new_version.to_dict(),
             "best_score": outcome.best_score,
+            "score_scope": "tuning",
             "metric_calls_budget": outcome.metric_calls_budget,
         }
 

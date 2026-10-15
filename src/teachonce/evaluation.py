@@ -18,14 +18,26 @@ Method ``auto`` picks ``llm_judge`` when an LLM is available, else
 
 from __future__ import annotations
 
+import hashlib
+import json
+import unicodedata
 from typing import Any
 
 from .errors import LLMNotConfiguredError, SchemaValidationError
 from .llm import LLMProvider, parse_json_response
 from .models import EvalReport, SkillVersion
+from .security import ensure_no_secrets
 from .store import SkillStore
 
 _HEURISTIC_MIN_HIT_RATIO = 0.5
+
+_OVERLAP_NOTES = (
+    "Case isolation: normalized situation fingerprints were checked for duplicates "
+    "and overlap with recorded GEPA optimization cases of both versions. This does "
+    "not detect paraphrases or semantic overlap with demonstrations/corrections; "
+    "older optimization versions may lack fingerprints. Independently prepare "
+    "held-out cases."
+)
 
 _DEFAULT_NOTES = {
     "heuristic": (
@@ -80,10 +92,10 @@ class SkillEvaluator:
         ``cases``: ``[{"situation": ..., "expected_decision": ...,
         "keywords": [...] (optional, used by heuristic)}]``.
         """
-        if not isinstance(cases, list) or not cases:
-            raise SchemaValidationError("Evaluation needs at least one held-out case.")
-        for idx, case in enumerate(cases):
-            _validate_case(case, idx)
+        case_fingerprints = _validate_cases(cases, purpose="Evaluation")
+        if not isinstance(notes, str):
+            raise SchemaValidationError("Evaluation notes must be a string.")
+        ensure_no_secrets(notes, where="evaluation notes")
         if method == "auto":
             method = "llm_judge" if self.llm is not None else "heuristic"
         if method not in ("llm_judge", "heuristic"):
@@ -98,6 +110,15 @@ class SkillEvaluator:
 
         sv_a = self.store.get_skill_version(skill_id, version_a)
         sv_b = self.store.get_skill_version(skill_id, version_b)
+        seen = set(sv_a.derived_from.get("optimization_cases", [])) | set(
+            sv_b.derived_from.get("optimization_cases", [])
+        )
+        for idx, case_fingerprint in enumerate(case_fingerprints):
+            if case_fingerprint in seen:
+                raise SchemaValidationError(
+                    f"Case #{idx} was used for optimization of a compared version. "
+                    "Supply independent held-out situations, not the tuning cases."
+                )
 
         results: list[dict[str, Any]] = []
         for idx, case in enumerate(cases):
@@ -106,6 +127,7 @@ class SkillEvaluator:
             results.append(
                 {
                     "case_index": idx,
+                    "situation_fingerprint": case_fingerprints[idx],
                     "situation": str(case.get("situation", "")),
                     "expected_decision": str(case.get("expected_decision", "")),
                     "supported_a": ok_a,
@@ -128,6 +150,8 @@ class SkillEvaluator:
             score_b=score_b,
             results=results,
             notes=_DEFAULT_NOTES[method]
+            + "\n"
+            + _OVERLAP_NOTES
             + (f"\nUser notes: {notes.strip()}" if notes.strip() else ""),
         )
         self.store.save_eval_report(report)
@@ -144,27 +168,57 @@ class SkillEvaluator:
         assert self.llm is not None  # guarded in evaluate()
         user_prompt = _format_judge_prompt(sv, case)
         raw = self.llm.complete(_JUDGE_SYSTEM_PROMPT, user_prompt, json_mode=True)
-        data = parse_json_response(raw)
-        supported = data.get("matches_expected")
-        if not isinstance(supported, bool):
-            raise SchemaValidationError(
-                "Evaluation 'matches_expected' must be a JSON boolean (true/false), "
-                "not a string or number. Retry the evaluation."
-            )
-        predicted = data.get("predicted_decision")
-        reasoning = data.get("reasoning")
-        if not isinstance(predicted, str) or not predicted.strip():
-            raise SchemaValidationError("Evaluation needs a non-empty 'predicted_decision' string.")
-        if not isinstance(reasoning, str) or not reasoning.strip():
-            raise SchemaValidationError("Evaluation needs a non-empty 'reasoning' string.")
-        predicted, reasoning = predicted.strip(), reasoning.strip()
-        detail = f"predicted: {predicted}" + (f" | {reasoning}" if reasoning else "")
+        supported, predicted, reasoning = _parse_judge_verdict(raw)
+        detail = f"predicted: {predicted} | {reasoning}"
         return supported, detail
 
 
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
+
+
+def _case_fingerprint(situation: str) -> str:
+    """Versioned normalized identity, deliberately excluding the expected answer."""
+    normalized = " ".join(unicodedata.normalize("NFKC", situation).casefold().split())
+    return "situation-v1:" + hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _validate_cases(cases: list[dict[str, Any]], *, purpose: str) -> list[str]:
+    """Validate the whole batch before any model call or optimization."""
+    if not isinstance(cases, list) or not cases:
+        raise SchemaValidationError(f"{purpose} needs at least one case.")
+    for idx, case in enumerate(cases):
+        _validate_case(case, idx)
+    try:
+        serialized = json.dumps(cases, ensure_ascii=False)
+    except (TypeError, ValueError) as exc:
+        raise SchemaValidationError("Cases must contain JSON-compatible values.") from exc
+    ensure_no_secrets(serialized, where=f"{purpose.lower()} cases")
+    fingerprints = [_case_fingerprint(case["situation"]) for case in cases]
+    if len(set(fingerprints)) != len(fingerprints):
+        raise SchemaValidationError(
+            f"{purpose} cases must have distinct situations. Remove duplicate cases; "
+            "changing an expected answer or case ID does not create a new situation."
+        )
+    return fingerprints
+
+
+def _parse_judge_verdict(raw: str) -> tuple[bool, str, str]:
+    """Use the same strict judge contract in evaluation and optimization."""
+    ensure_no_secrets(raw, where="judge response")
+    data = parse_json_response(raw)
+    supported = data.get("matches_expected")
+    if not isinstance(supported, bool):
+        raise SchemaValidationError(
+            "Evaluation 'matches_expected' must be a JSON boolean (true/false), "
+            "not a string or number. Retry the evaluation."
+        )
+    for field in ("predicted_decision", "reasoning"):
+        value = data.get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise SchemaValidationError(f"Evaluation needs a non-empty '{field}' string.")
+    return supported, data["predicted_decision"].strip(), data["reasoning"].strip()
 
 
 def _validate_case(case: dict[str, Any], idx: int) -> None:

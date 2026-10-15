@@ -235,6 +235,7 @@ class CorrectionEngine:
             changes=changes,
             status="candidate",
             derived_from={
+                **{key: list(values) for key, values in base_sv.derived_from.items()},
                 "demonstrations": list(base_sv.derived_from.get("demonstrations", [])),
                 "corrections": correction_sources,
             },

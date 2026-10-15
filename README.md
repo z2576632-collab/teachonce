@@ -116,10 +116,18 @@ Claude Code 的 `~/.claude.json`，用你实际环境的 Python 绝对路径替�
 pip install "teachonce[gepa]"   # 装在同一 Python 环境
 ```
 
-之后 `teachonce_optimize_skill` 会用 GEPA 的反思进化（reflective evolution）在未见案例上
+之后 `teachonce_optimize_skill` 会用 GEPA 的反思进化（reflective evolution）在调优案例上
 自动优化决策规则。优化用的判分是 TeachOnce 自带的 LLM judge，反思模型复用你配置的
 OpenAI 兼容 API。**产物永远是 candidate**——必须人工审批 + 回归评估后才成为 active 版本，
 预算（`max_metric_calls`）显式受控。
+
+传给优化器的 `cases` 会参与学习，返回的 `best_score` 是调优分数。
+请另留一组独立案例用于 `teachonce_evaluate_versions`。新优化版本保存调优案例的
+`situation` 指纹，多轮优化和后续纠错会继承它们；服务重启后依然会拒绝将这些案例
+当作未见案例评估。指纹忽略大小写、空白和 Unicode 全半角差异，不依赖期望答案或案例 ID。
+评估和优化也会拒绝批次中的重复情境，并在模型调用前扫描敏感内容。
+这种检查不能识别同义改写、示范/纠错的语义重叠，也不能补回旧优化版本缺失的指纹，
+独立准备评估集仍是调用者的责任。
 
 **OpenAdapt 录制导入**（[OpenAdaptAI](https://github.com/OpenAdaptAI)，MIT）：
 
@@ -127,7 +135,7 @@ OpenAI 兼容 API。**产物永远是 candidate**——必须人工审批 + 回�
 **默认关闭**：需先设置 `TEACHCONE_GUI_OBSERVATION=1` 显式授权，且导入前请自查导出内容
 （会经敏感信息扫描，但屏幕上放过什么只有你知道）。适配器只读导出文件，不会启动录制。
 
-### 5. 换一个聊天后继续学习
+### 6. 换一个聊天后继续学习
 
 只要 MCP Server 仍使用同一个数据库（默认 `~/.teachonce/teachonce.db`），
 新聊天或服务重启后都可以从保存的记录继续：
@@ -143,7 +151,8 @@ OpenAI 兼容 API。**产物永远是 candidate**——必须人工审批 + 回�
 并发请求或写入失败不会留下“新版本已生成、纠错却没标记”的半完成状态。
 
 评估仅接受真正的 JSON 布尔值 `true` / `false`；字符串 `"false"` 等无效输出会报错，
-不会生成评估分数。报告始终保留方法局限，自定义备注不能覆盖它们。
+不会生成评估分数。GEPA 裁判遵循相同校验，预测和理由都必须是非空字符串。
+报告始终保留评估方法和案例隔离检查的局限，自定义备注不能覆盖它们。
 
 ## 项目结构
 
@@ -177,7 +186,7 @@ teachonce/
 - ✅ 未见案例版本评估（LLM 裁判 + 离线启发式两种模式，均如实标注方法论）
 - ✅ MCP Server（16 个工具）+ Agent Skills `SKILL.md` 导出
 - ✅ 多轮纠错保留规则标识和累计证据，版本与纠错状态原子保存
-- ✅ **GEPA 反思进化适配器**：未见案例驱动的规则自动优化（可选 `[gepa]` extra；真实验证见 docs/PRODUCT.md §4.3）
+- ✅ **GEPA 反思进化适配器**：调优案例驱动的规则自动优化，保存案例指纹以隔离后续评估（可选 `[gepa]` extra；历史手工验证记录见 docs/PRODUCT.md §4.3）
 - ✅ **OpenAdapt 录制导入适配器**：GUI 操作记录转示范（需 `TEACHCONE_GUI_OBSERVATION=1` 显式授权）
 - ✅ SQLite 本地存储，数据默认不出本机
 - ✅ pytest 全套测试 + ruff + GitHub Actions CI
